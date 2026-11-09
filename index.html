@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshLab - Structural Analysis Workbench</title>
+<meta name="description" content="Interactive 2D and 3D truss, frame and plate finite element analysis with live stress contours, modal shapes and CalculiX export.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#canvas-panel">Skip to structural canvas</a>
+
+<header class="site-header">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+      <path d="M4 32 L12 12 L20 32 L28 12 L36 32" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+      <path d="M4 32 H36" fill="none" stroke="currentColor" stroke-width="2.2"/>
+      <circle cx="12" cy="12" r="2.6" fill="currentColor"/>
+      <circle cx="28" cy="12" r="2.6" fill="currentColor"/>
+      <circle cx="20" cy="32" r="2.6" fill="currentColor"/>
+    </svg>
+    <div class="brand-text">
+      <span class="brand-name">MESH<span class="brand-accent">LAB</span></span>
+      <span class="brand-sub">STRUCTURAL ANALYSIS WORKBENCH <span class="brand-ver">v1.0.0</span></span>
+    </div>
+  </div>
+  <div class="header-meta">
+    <span class="unit-chip" title="All quantities use SI units">SI UNITS <span class="unit-sep">/</span> m, N, Pa, kg, Hz</span>
+    <button type="button" id="theme-toggle" class="theme-btn" aria-pressed="true" title="Switch to light blueprint mode">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 0 7.5 7.5A5.6 5.6 0 0 1 10 2.5z" fill="currentColor"/></svg>
+      <span id="theme-label">LIGHT MODE</span>
+    </button>
+  </div>
+</header>
+
+<div class="filter-bar" role="group" aria-label="Model and view controls">
+  <label class="field">
+    <span class="field-label">STRUCTURE</span>
+    <select id="preset-select" aria-label="Select a structural preset"></select>
+  </label>
+  <label class="field">
+    <span class="field-label">VIEW</span>
+    <select id="view-select" aria-label="Select a result view">
+      <option value="force">Axial force</option>
+      <option value="stress">von Mises stress</option>
+      <option value="deformed">Deformed shape</option>
+      <option value="modes">Modal shape</option>
+    </select>
+  </label>
+  <label class="field field-slider">
+    <span class="field-label">DEFORMATION SCALE <output id="scale-output" for="scale-range">100x</output></span>
+    <input type="range" id="scale-range" min="1" max="500" value="100" step="1" aria-label="Deformation exaggeration from 1x to 500x">
+  </label>
+  <div class="filter-spacer"></div>
+  <div class="toggle-group" role="group" aria-label="Overlay toggles">
+    <label class="check"><input type="checkbox" id="toggle-ghost" checked><span>Ghost geometry</span></label>
+    <label class="check"><input type="checkbox" id="toggle-reactions" checked><span>Reactions</span></label>
+    <label class="check"><input type="checkbox" id="toggle-grid" checked><span>Grid</span></label>
+  </div>
+</div>
+
+<main class="workspace">
+  <section class="canvas-panel" id="canvas-panel" aria-label="Structural canvas">
+    <div class="panel-head">
+      <div>
+        <h1 id="model-title">Pratt Bridge Truss (7-Bay)</h1>
+        <p class="panel-sub" id="model-caption">2D pin jointed truss. Direct stiffness solution, SI units.</p>
+      </div>
+      <div class="panel-actions">
+        <span class="live-chip"><span class="live-dot"></span> SOLVED</span>
+        <div class="download-group" role="group" aria-label="Export results">
+          <button type="button" class="dl-btn" data-export="inp" title="Download CalculiX / Abaqus input deck">.INP</button>
+          <button type="button" class="dl-btn" data-export="svg" title="Download the deformed shape as SVG">.SVG</button>
+          <button type="button" class="dl-btn" data-export="json" title="Download the full analysis report as JSON">.JSON</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap" id="canvas-wrap">
+      <svg id="structure-svg" role="img" aria-label="Structural analysis diagram" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="canvas-corner tl" aria-hidden="true"></div>
+      <div class="canvas-corner tr" aria-hidden="true"></div>
+      <div class="canvas-corner bl" aria-hidden="true"></div>
+      <div class="canvas-corner br" aria-hidden="true"></div>
+      <div id="tooltip" class="tooltip" role="status" aria-live="polite" hidden></div>
+    </div>
+
+    <div class="legend-row" id="legend-row" aria-label="Color legend"></div>
+
+    <div class="mode-scrub" id="mode-scrub" hidden>
+      <div class="scrub-head">
+        <label for="mode-select" class="field-label">MODE</label>
+        <select id="mode-select" aria-label="Select a vibration mode"></select>
+        <label for="mode-phase" class="field-label phase-label">PHASE</label>
+        <input type="range" id="mode-phase" min="0" max="360" value="0" step="1" aria-label="Vibration phase angle">
+        <button type="button" id="mode-play" class="play-btn" aria-pressed="false" title="Animate the mode shape">PLAY</button>
+        <span class="mode-readout" id="mode-readout">f = 0.00 Hz</span>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side-panel" aria-label="Analysis results">
+    <div class="stat-grid" id="stat-grid" aria-label="Headline result figures"></div>
+
+    <section class="card" aria-labelledby="equilibrium-title">
+      <div class="card-head">
+        <h2 id="equilibrium-title">GLOBAL EQUILIBRIUM</h2>
+        <span class="card-badge" id="equilibrium-badge">CHECK</span>
+      </div>
+      <table class="kv-table" id="equilibrium-table"><tbody></tbody></table>
+    </section>
+
+    <section class="card" aria-labelledby="determinacy-title">
+      <div class="card-head"><h2 id="determinacy-title">DETERMINACY</h2></div>
+      <table class="kv-table" id="determinacy-table"><tbody></tbody></table>
+    </section>
+
+    <section class="card" aria-labelledby="safety-title">
+      <div class="card-head">
+        <h2 id="safety-title">SAFETY ENVELOPE</h2>
+        <span class="card-badge" id="safety-badge">OK</span>
+      </div>
+      <div id="safety-meter" class="meter-block"></div>
+    </section>
+
+    <section class="card" aria-labelledby="modes-title">
+      <div class="card-head"><h2 id="modes-title">NATURAL FREQUENCIES</h2></div>
+      <div id="mode-bars" class="mode-bars"></div>
+    </section>
+  </aside>
+</main>
+
+<section class="table-panel" aria-labelledby="members-title">
+  <div class="table-head">
+    <div>
+      <h2 id="members-title">MEMBER FORCES &amp; BUCKLING SAFETY</h2>
+      <p class="panel-sub" id="table-caption">Per member axial force, stress and governing factor of safety. Sortable.</p>
+    </div>
+    <label class="table-filter">
+      <span class="field-label">SHOW</span>
+      <select id="member-filter" aria-label="Filter member table rows">
+        <option value="all">All members</option>
+        <option value="tension">Tension only</option>
+        <option value="compression">Compression only</option>
+        <option value="critical">Critical only</option>
+      </select>
+    </label>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table" id="member-table">
+      <thead>
+        <tr>
+          <th scope="col"><button type="button" data-sort="id">MEMBER</button></th>
+          <th scope="col"><button type="button" data-sort="length">L (m)</button></th>
+          <th scope="col"><button type="button" data-sort="axialForce">AXIAL N (kN)</button></th>
+          <th scope="col"><button type="button" data-sort="stress">STRESS (MPa)</button></th>
+          <th scope="col"><button type="button" data-sort="strain">STRAIN</button></th>
+          <th scope="col"><button type="button" data-sort="euler">P_CR (kN)</button></th>
+          <th scope="col"><button type="button" data-sort="slenderness">L / r</button></th>
+          <th scope="col"><button type="button" data-sort="fos">FoS GOV.</button></th>
+          <th scope="col">STATE</th>
+        </tr>
+      </thead>
+      <tbody id="member-tbody"></tbody>
+    </table>
+  </div>
+  <p class="table-foot" id="table-foot"></p>
+</section>
+
+<footer class="site-footer">
+  <span>MESHLAB <span class="foot-sep">/</span> OPEN SOURCE STRUCTURAL ANALYSIS</span>
+  <span>MIT LICENSE <span class="foot-sep">/</span> 2026</span>
+  <span>DIRECT STIFFNESS <span class="foot-sep">/</span> EULER BUCKLING <span class="foot-sep">/</span> CST PLANE STRESS</span>
+</footer>
+
+<script src="fem.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
