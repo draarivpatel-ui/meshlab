@@ -73,7 +73,7 @@ const threeBarUy = (P) => -P / (
 
 test('module loads as a CommonJS UMD export', () => {
   assert.equal(typeof M, 'object');
-  assert.equal(M.version, '1.0.0');
+  assert.equal(M.version, '2.0.0');
   assert.equal(typeof M.solveTruss, 'function');
   assert.equal(typeof M.analyzeSafety, 'function');
   assert.equal(typeof M.solveModes, 'function');
@@ -87,9 +87,10 @@ test('module also attaches to a browser global via the UMD factory', () => {
   const sandbox = { window: {}, console: console, Math: Math, Float64Array: Float64Array };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(require.resolve('./field.js'), 'utf8'), sandbox, { filename: 'field.js' });
   vm.runInContext(src, sandbox, { filename: 'fem.js' });
   assert.equal(typeof sandbox.MeshLab, 'object');
-  assert.equal(sandbox.MeshLab.version, '1.0.0');
+  assert.equal(sandbox.MeshLab.version, '2.0.0');
   const sol = sandbox.MeshLab.solveTruss(twoBar(1000));
   assert.equal(sol.members.length, 2);
 });
@@ -705,15 +706,8 @@ test('CST reactions equal K u minus F', () => {
   const p = tensionPlate(3, 2);
   const s = M.solvePlateCST(p.mesh, p.mat, p.bc, p.loads);
   const Ku = M.matVec(s.stiffnessMatrix, s.displacements);
-  const F = new Float64Array(s.displacements.length);
-  s.nodes.forEach((n, i) => {
-    /* nodal loads are recovered from K u - R */
-  });
-  for (let i = 0; i < Ku.length; i++) {
-    const expected = Ku[i] - s.reactions[i];
-    assert.ok(isFinite(expected));
-  }
-  assert.equal(F.length, s.displacements.length);
+  for (let i = 0; i < Ku.length; i++) close(s.reactions[i], Ku[i] - s.forceVector[i], 1e-6);
+  s.fixedMask.forEach((fixed, i) => { if (!fixed) close(s.reactions[i], 0, 1e-6); });
 });
 
 test('CST displacements grow linearly along the loaded direction', () => {
@@ -765,16 +759,17 @@ test('CST mesh refinement does not change the exact uniform stress', () => {
 /* Presets                                                                    */
 /* ------------------------------------------------------------------------- */
 
-test('six built in presets are listed with the required names', () => {
+test('seven built in presets are listed with the required names', () => {
   const names = M.getPresets().map((p) => p.name);
-  assert.equal(names.length, 6);
+  assert.equal(names.length, 7);
   assert.deepEqual(names, [
     'Pratt Bridge Truss (7-Bay)',
     'Warren Roof Truss',
     'Cantilever Crane Boom',
     'Transmission Tower Lattice',
     '3D Space Tripod Dome',
-    'Perforated Plate in Tension (Kirsch Stress Concentration)'
+    'Perforated Plate in Tension (Kirsch Stress Concentration)',
+    'Heat Flow on a Delaunay Mesh'
   ]);
 });
 
@@ -997,7 +992,7 @@ test('all exporters are pure functions over the same model', () => {
 test('project source files contain no typographic dashes', () => {
   const fs = require('node:fs');
   const path = require('node:path');
-  const files = ['fem.js', 'test.js', 'index.html', 'style.css', 'app.js', 'README.md', 'LICENSE'];
+  const files = ['field.js', 'fem.js', 'test.js', 'numerics.test.js', 'ui.test.js', 'dom-fixture.js', 'index.html', 'style.css', 'app.js', 'README.md', 'DEVPOST_UPGRADE.md', 'LICENSE'];
   const emDash = String.fromCharCode(0x2014);
   const enDash = String.fromCharCode(0x2013);
   files.forEach((f) => {
@@ -1012,7 +1007,7 @@ test('project source files contain no typographic dashes', () => {
 test('project source files contain no restricted vendor references', () => {
   const fs = require('node:fs');
   const path = require('node:path');
-  const files = ['fem.js', 'test.js', 'index.html', 'style.css', 'app.js', 'README.md', 'LICENSE'];
+  const files = ['field.js', 'fem.js', 'test.js', 'numerics.test.js', 'ui.test.js', 'dom-fixture.js', 'index.html', 'style.css', 'app.js', 'README.md', 'DEVPOST_UPGRADE.md', 'LICENSE'];
   /* Terms are assembled from character codes so this checker does not match
      its own source text. */
   const spell = (codes) => codes.map((c) => String.fromCharCode(c)).join('');
@@ -1022,7 +1017,7 @@ test('project source files contain no restricted vendor references', () => {
     spell([108, 97, 114, 103, 101, 32, 108, 97, 110, 103, 117, 97, 103, 101, 32, 109, 111, 100, 101, 108]),
     spell([76, 76, 77]), spell([71, 80, 84]),
     spell([67, 108, 97, 117, 100, 101]), spell([65, 110, 116, 104, 114, 111, 112, 105, 99]),
-    spell([79, 112, 101, 110, 65, 73]), spell([97, 103, 101, 110, 116, 115])
+    spell([79, 112, 101, 110, 65, 73]), spell([97, 103, 101, 110, 116, 115]), spell([65, 73])
   ];
   const pattern = new RegExp('\\b(' + words.join('|') + ')\\b', 'i');
   files.forEach((f) => {
@@ -1030,5 +1025,8 @@ test('project source files contain no restricted vendor references', () => {
     if (!fs.existsSync(p)) return;
     const src = fs.readFileSync(p, 'utf8');
     assert.ok(!pattern.test(src), f + ' contains a restricted reference');
+    const prefixes = [spell([115, 107, 45]), spell([116, 115, 107, 101, 121, 45]), spell([103, 104, 112, 95]), spell([65, 73, 122, 97])];
+    assert.ok(!prefixes.some(prefix => src.includes(prefix)), f + ' contains a restricted key prefix');
+    assert.ok(!/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(src), f + ' contains a personal contact address');
   });
 });

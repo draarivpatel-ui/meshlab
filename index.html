@@ -3,11 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MeshLab - Structural Analysis Workbench</title>
-<meta name="description" content="Interactive 2D and 3D truss, frame and plate finite element analysis with live stress contours, modal shapes and CalculiX export.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<title>MeshLab - See the Physics. Check the Math.</title>
+<meta name="description" content="A zero dependency engineering workbench: truss load paths, plate stress concentration, modal shapes and Delaunay Poisson FEM, with live numerical verification.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -24,7 +21,7 @@
     </svg>
     <div class="brand-text">
       <span class="brand-name">MESH<span class="brand-accent">LAB</span></span>
-      <span class="brand-sub">STRUCTURAL ANALYSIS WORKBENCH <span class="brand-ver">v1.0.0</span></span>
+      <span class="brand-sub">ENGINEERING WORKBENCH <span class="brand-ver">v2.0.0</span></span>
     </div>
   </div>
   <div class="header-meta">
@@ -35,6 +32,16 @@
     </button>
   </div>
 </header>
+
+<section class="showcase" aria-labelledby="showcase-title">
+  <div class="showcase-intro"><span class="eyebrow">A LAB YOU CAN INSPECT</span><h2 id="showcase-title">See the physics. Check the math.</h2><p>One click, a real numerical experiment. Change the load, inspect the result, and challenge the solver.</p></div>
+  <div class="showcase-grid" role="group" aria-label="One click showcase experiments">
+    <button type="button" class="scenario-btn" data-scenario="bridge"><span class="scenario-index">01 / LOAD PATH</span><strong>Trace a bridge</strong><span>Watch tension and compression balance.</span></button>
+    <button type="button" class="scenario-btn" data-scenario="crane"><span class="scenario-index">02 / FAILURE LIMIT</span><strong>Overload a crane</strong><span>Find the member that governs safety.</span></button>
+    <button type="button" class="scenario-btn" data-scenario="plate"><span class="scenario-index">03 / STRESS CONCENTRATION</span><strong>Stress around a hole</strong><span>A small opening redirects a large force.</span></button>
+    <button type="button" class="scenario-btn" data-scenario="heat"><span class="scenario-index">04 / FIELD PHYSICS</span><strong>Follow the heat</strong><span>Delaunay triangles, Poisson FEM, live flux.</span></button>
+  </div>
+</section>
 
 <div class="filter-bar" role="group" aria-label="Model and view controls">
   <label class="field">
@@ -51,26 +58,27 @@
     </select>
   </label>
   <label class="field field-slider">
-    <span class="field-label">DEFORMATION SCALE <output id="scale-output" for="scale-range">100x</output></span>
+    <span class="field-label"><span id="scale-label">DEFORMATION SCALE</span> <output id="scale-output" for="scale-range">100x</output></span>
     <input type="range" id="scale-range" min="1" max="500" value="100" step="1" aria-label="Deformation exaggeration from 1x to 500x">
   </label>
+  <label class="field field-load"><span class="field-label"><span id="load-label">LOAD MULTIPLIER</span> <output id="load-output" for="load-range">1.0x</output></span><input type="range" id="load-range" min="0" max="5" value="1" step="0.1" aria-label="Applied load multiplier"></label>
   <div class="filter-spacer"></div>
   <div class="toggle-group" role="group" aria-label="Overlay toggles">
     <label class="check"><input type="checkbox" id="toggle-ghost" checked><span>Ghost geometry</span></label>
-    <label class="check"><input type="checkbox" id="toggle-reactions" checked><span>Reactions</span></label>
+    <label class="check"><input type="checkbox" id="toggle-reactions" checked><span id="reactions-label">Reactions</span></label>
     <label class="check"><input type="checkbox" id="toggle-grid" checked><span>Grid</span></label>
   </div>
 </div>
 
 <main class="workspace">
-  <section class="canvas-panel" id="canvas-panel" aria-label="Structural canvas">
+  <section class="canvas-panel" id="canvas-panel" aria-label="Engineering canvas" tabindex="-1">
     <div class="panel-head">
       <div>
         <h1 id="model-title">Pratt Bridge Truss (7-Bay)</h1>
         <p class="panel-sub" id="model-caption">2D pin jointed truss. Direct stiffness solution, SI units.</p>
       </div>
       <div class="panel-actions">
-        <span class="live-chip"><span class="live-dot"></span> SOLVED</span>
+        <span class="live-chip" id="solve-status"><span class="live-dot"></span> SOLVED</span>
         <div class="download-group" role="group" aria-label="Export results">
           <button type="button" class="dl-btn" data-export="inp" title="Download CalculiX / Abaqus input deck">.INP</button>
           <button type="button" class="dl-btn" data-export="svg" title="Download the deformed shape as SVG">.SVG</button>
@@ -80,7 +88,7 @@
     </div>
 
     <div class="canvas-wrap" id="canvas-wrap">
-      <svg id="structure-svg" role="img" aria-label="Structural analysis diagram" preserveAspectRatio="xMidYMid meet"></svg>
+      <svg id="structure-svg" role="group" aria-label="Engineering analysis diagram" preserveAspectRatio="xMidYMid meet" aria-describedby="canvas-help"></svg>
       <div class="canvas-corner tl" aria-hidden="true"></div>
       <div class="canvas-corner tr" aria-hidden="true"></div>
       <div class="canvas-corner bl" aria-hidden="true"></div>
@@ -89,6 +97,9 @@
     </div>
 
     <div class="legend-row" id="legend-row" aria-label="Color legend"></div>
+    <div class="inspection-panel" id="inspector" role="status" aria-live="polite"><span class="eyebrow">LIVE INSPECTOR</span><p>Hover a result or select it to pin its measurements.</p></div>
+    <p class="canvas-help" id="canvas-help">Tab into the diagram. Arrow keys move between results. Enter pins a result. Escape clears inspection. <span id="verification-summary"></span></p>
+    <div class="verification-strip"><button type="button" id="run-checks" class="check-btn">RUN ROUND-TRIP CHECK</button><p id="status-message" role="status" aria-live="polite">Preparing analysis.</p></div>
 
     <div class="mode-scrub" id="mode-scrub" hidden>
       <div class="scrub-head">
@@ -149,7 +160,7 @@
       </select>
     </label>
   </div>
-  <div class="table-scroll">
+  <div class="table-scroll" tabindex="0" aria-label="Scrollable numerical results">
     <table class="data-table" id="member-table">
       <thead>
         <tr>
@@ -173,9 +184,10 @@
 <footer class="site-footer">
   <span>MESHLAB <span class="foot-sep">/</span> OPEN SOURCE STRUCTURAL ANALYSIS</span>
   <span>MIT LICENSE <span class="foot-sep">/</span> 2026</span>
-  <span>DIRECT STIFFNESS <span class="foot-sep">/</span> EULER BUCKLING <span class="foot-sep">/</span> CST PLANE STRESS</span>
+  <span>DIRECT STIFFNESS <span class="foot-sep">/</span> CST PLANE STRESS <span class="foot-sep">/</span> POISSON FEM</span>
 </footer>
 
+<script src="field.js"></script>
 <script src="fem.js"></script>
 <script src="app.js"></script>
 </body>

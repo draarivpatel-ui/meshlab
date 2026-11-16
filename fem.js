@@ -1,5 +1,5 @@
 /*
- * MeshLab - finite element structural analysis for trusses, frames and plates
+ * MeshLab - finite element analysis for trusses, plates and scalar fields
  * MIT License. Copyright (c) 2026 draarivpatel-ui
  *
  * Units are SI throughout: metres, newtons, pascals, kilograms.
@@ -8,11 +8,11 @@
 (function (root, factory) {
   'use strict';
   if (typeof module === 'object' && module.exports) {
-    module.exports = factory();
+    module.exports = factory(require('./field.js'));
   } else {
-    root.MeshLab = factory();
+    root.MeshLab = factory(root.MeshField);
   }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (Field) {
   'use strict';
 
   // ---------------------------------------------------------------------------
@@ -67,6 +67,10 @@
 
   /* Gaussian elimination with partial pivoting. Returns null on a singular matrix. */
   function solveLinear(Ain, bin) {
+    if (!Array.isArray(Ain) || !bin || Ain.length !== bin.length ||
+        Ain.some(function (row) { return !row || row.length !== bin.length; })) {
+      throw new Error('MeshLab: linear system dimensions do not match');
+    }
     var n = bin.length, A = new Array(n), b = Float64Array.from(bin), i, j, k;
     for (i = 0; i < n; i++) A[i] = Float64Array.from(Ain[i]);
     var scale = zeros(n);
@@ -119,11 +123,11 @@
       }
       var norm = 0;
       for (i = 0; i < n; i++) norm += A[i][i] * A[i][i];
-      if (biggest <= 1e-12 * Math.sqrt(norm + 1) || off === 0) break;
+      if (biggest <= 1e-12 * Math.sqrt(norm) || off === 0) break;
       for (p = 0; p < n - 1; p++) {
         for (q = p + 1; q < n; q++) {
           var apq = A[p][q];
-          var threshold = 1e-14 * Math.sqrt(norm + 1);
+          var threshold = 1e-14 * Math.sqrt(norm);
           if (Math.abs(apq) <= threshold) continue;
           var theta = (A[q][q] - A[p][p]) / (2 * apq);
           var t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
@@ -165,6 +169,28 @@
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
   function num(v, fallback) { return (typeof v === 'number' && isFinite(v)) ? v : fallback; }
 
+  function checked(v, fallback, label, positive) {
+    if (v === undefined || v === null) return fallback;
+    if (typeof v !== 'number' || !Number.isFinite(v) || (positive && !(v > 0))) {
+      throw new Error('MeshLab: ' + label + ' must be ' + (positive ? 'positive and ' : '') + 'finite');
+    }
+    return v;
+  }
+  function peakTranslation(nodes, dim, displacement) {
+    return nodes.reduce(function (peak, _, i) {
+      var magnitude = 0;
+      for (var d = 0; d < dim; d++) magnitude += displacement[dim * i + d] * displacement[dim * i + d];
+      return Math.max(peak, Math.sqrt(magnitude));
+    }, 0);
+  }
+  function verification(sys, displacement, reactions, energy) {
+    var forceScale = Math.sqrt(dot(sys.F, sys.F)) || 1, freeResidual = 0, work = dot(sys.F, displacement);
+    for (var i = 0; i < reactions.length; i++) if (!sys.fixedMask[i]) freeResidual = Math.max(freeResidual, Math.abs(reactions[i]));
+    var energyError = Math.abs(2 * energy - work) / Math.max(Math.abs(work), 1e-20);
+    return { freeResidual: freeResidual, relativeResidual: freeResidual / forceScale,
+      energyError: energyError, passed: freeResidual / forceScale < 1e-8 && energyError < 1e-8 };
+  }
+
   // ---------------------------------------------------------------------------
   // Model normalisation
   // ---------------------------------------------------------------------------
@@ -180,10 +206,13 @@
     if (!input || !Array.isArray(input.nodes) || !Array.isArray(input.members)) {
       throw new Error('MeshLab: model needs nodes[] and members[] arrays');
     }
+    if (input.dim !== undefined && input.dim !== 2 && input.dim !== 3 && input.dim !== 'auto') throw new Error('MeshLab: dimension must be 2, 3 or auto');
     var dim = (input.dim === 3 || (input.dim === 'auto' && input.nodes.some(function (n) {
-      return n && !Array.isArray(n) && isFinite(n.z) && Math.abs(n.z) > 1e-12;
+      var p = Array.isArray(n) ? n : n && (n.coords || n.xyz || n.p || [n.x, n.y, n.z]);
+      return p && isFinite(p[2]) && Math.abs(p[2]) > 1e-12;
     }))) ? 3 : 2;
     var nodes = input.nodes.map(function (n, i) {
+      if (!n || typeof n !== 'object') throw new Error('MeshLab: node ' + i + ' is invalid');
       var p;
       if (Array.isArray(n)) {
         p = n;
@@ -193,37 +222,44 @@
         p = [n.x, n.y, n.z];
       }
       var id = num(Array.isArray(n) ? i : n.id, i);
-      var load = (!Array.isArray(n) && n.load) ? n.load.slice(0, dim) : [0, 0, 0].slice(0, dim);
+      var rawLoad = (!Array.isArray(n) && n.load) || [];
+      if (!Array.isArray(rawLoad)) throw new Error('MeshLab: nodal load must be an array');
+      var load = [];
+      for (var d = 0; d < dim; d++) load.push(checked(rawLoad[d], 0, 'nodal load', false));
+      var support = (!Array.isArray(n) && n.support) || 'free';
+      if (support !== 'free' && !BC_DOF[support]) throw new Error('MeshLab: unknown support ' + support);
       return {
         id: id,
-        x: num(p[0], 0), y: num(p[1], 0), z: dim === 3 ? num(p[2], 0) : 0,
-        support: (!Array.isArray(n) && n.support) || 'free',
+        x: checked(p[0], 0, 'node x', false), y: checked(p[1], 0, 'node y', false), z: dim === 3 ? checked(p[2], 0, 'node z', false) : 0,
+        support: support,
         load: load
       };
     });
     var defaultMat = input.material || {};
-    var E = num(defaultMat.E, 2.0e11);
-    var rho = num(defaultMat.rho, 7850);
-    var yieldStress = num(defaultMat.sigmaYield, num(defaultMat.sigma_yield, 2.5e8));
+    var E = checked(defaultMat.E, 2.0e11, 'Young modulus', true);
+    var rho = checked(defaultMat.rho, 7850, 'density', true);
+    var yieldStress = checked(defaultMat.sigmaYield, checked(defaultMat.sigma_yield, 2.5e8, 'yield stress', true), 'yield stress', true);
     var members = input.members.map(function (m, i) {
-      var a = num(m.a !== undefined ? m.a : m.n1, 0);
-      var b = num(m.b !== undefined ? m.b : m.n2, 0);
+      if (!m || typeof m !== 'object') throw new Error('MeshLab: member ' + i + ' is invalid');
+      var a = m.a !== undefined ? m.a : m.n1;
+      var b = m.b !== undefined ? m.b : m.n2;
+      if (!Number.isInteger(a) || !Number.isInteger(b) || !nodes[a] || !nodes[b]) throw new Error('MeshLab: member references a missing node');
       var mat = m.material || {};
       return {
         id: i, a: a, b: b,
         label: m.label || ('M' + (i + 1)),
-        E: num(m.E, num(mat.E, E)),
-        A: num(m.A, num(mat.A, 0.01)),
-        I: num(m.I, num(mat.I, 1e-6)),
-        rho: num(m.rho, num(mat.rho, rho)),
-        sigmaYield: num(m.sigmaYield, num(mat.sigmaYield, yieldStress)),
-        Keff: clamp(num(m.Keff, num(mat.Keff, 1.0)), 0.25, 4),
-        rGyr: num(m.rGyr, num(mat.rGyr, null))
+        E: checked(m.E, checked(mat.E, E, 'Young modulus', true), 'Young modulus', true),
+        A: checked(m.A, checked(mat.A, 0.01, 'cross section area', true), 'cross section area', true),
+        I: checked(m.I, checked(mat.I, 1e-6, 'second moment of area', true), 'second moment of area', true),
+        rho: checked(m.rho, checked(mat.rho, rho, 'density', true), 'density', true),
+        sigmaYield: checked(m.sigmaYield, checked(mat.sigmaYield, yieldStress, 'yield stress', true), 'yield stress', true),
+        Keff: checked(m.Keff, checked(mat.Keff, 1, 'effective length factor', true), 'effective length factor', true),
+        rGyr: checked(m.rGyr, checked(mat.rGyr, null, 'radius of gyration', true), 'radius of gyration', true)
       };
     });
     return { dim: dim, nodes: nodes, members: members, material: {
       E: E, rho: rho, sigmaYield: yieldStress
-    }, name: input.name || 'Untitled structure' };
+    }, name: input.name || 'Untitled structure', massType: input.massType || 'lumped' };
   }
 
   function nodeCoords(n, dim) { return dim === 3 ? [n.x, n.y, n.z] : [n.x, n.y]; }
@@ -246,21 +282,25 @@
     if (Array.isArray(list)) {
       list.forEach(function (s) {
         var n = model.nodes[num(s.node !== undefined ? s.node : s.n, -1)];
-        if (n) n.support = s.type || s.support || 'pin';
+        if (!n) throw new Error('MeshLab: support references a missing node');
+        n.support = s.type || s.support || 'pin';
+        if (n.support !== 'free' && !BC_DOF[n.support]) throw new Error('MeshLab: unknown support ' + n.support);
       });
     } else if (list && typeof list === 'object') {
       Object.keys(list).forEach(function (key) {
         var n = model.nodes[Number(key)];
-        if (n) n.support = list[key];
+        if (!n) throw new Error('MeshLab: support references a missing node');
+        n.support = list[key];
+        if (n.support !== 'free' && !BC_DOF[n.support]) throw new Error('MeshLab: unknown support ' + n.support);
       });
     }
     var loads = raw.loads;
     if (Array.isArray(loads)) {
       loads.forEach(function (L) {
         var n = model.nodes[num(L.node !== undefined ? L.node : L.n, -1)];
-        if (!n) return;
+        if (!n) throw new Error('MeshLab: load references a missing node');
         var f = L.f || L.load || L.force || [];
-        for (var i = 0; i < model.dim; i++) n.load[i] += num(f[i], 0);
+        for (var i = 0; i < model.dim; i++) n.load[i] += checked(f[i], 0, 'load component', false);
       });
     }
   }
@@ -329,11 +369,12 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Direct stiffness truss / frame solver
+  // Direct stiffness truss solver
   // ---------------------------------------------------------------------------
 
   function solveTruss(modelInput) {
     var model = normalizeModel(modelInput);
+    if (model.nodes.length < 2 || model.members.length < 1) throw new Error('MeshLab: a truss needs two nodes and a member');
     applySupports(model, modelInput);
     var sys = buildSystem(model, { mass: true });
     var red = reducedSystem(sys);
@@ -392,7 +433,9 @@
       nodes: nodes, members: members, displacements: Array.from(u),
       forceVector: Array.from(sys.F), reactions: Array.from(R),
       stiffnessMatrix: sys.K, massMatrix: sys.M, fixedMask: sys.fixedMask,
-      maxDisplacement: Math.max.apply(null, Array.from(u).map(Math.abs).concat([0])),
+      maxDisplacement: peakTranslation(model.nodes, model.dim, u),
+      maxComponentDisplacement: Math.max.apply(null, Array.from(u).map(Math.abs).concat([0])),
+      verification: verification(sys, u, R, totalU),
       strainEnergy: totalU, externalWork: work,
       determinacy: {
         m: model.members.length, r: r, j: model.nodes.length,
@@ -458,23 +501,34 @@
 
   function solveModes(modelInput, numModes) {
     var model = normalizeModel(modelInput);
+    if (modelInput.massType && modelInput.massType !== 'lumped' && modelInput.massType !== 'consistent') {
+      throw new Error('MeshLab: unknown mass formulation');
+    }
     applySupports(model, modelInput);
     var sys = buildSystem(model, { mass: true, massType: modelInput.massType || 'lumped' });
     var red = reducedSystem(sys);
     var n = red.n;
     var count = clamp(Math.floor(num(numModes, 4)), 1, n);
-    if (n === 0) return { modes: [], frequencies: [], numModes: 0, ndof: sys.ndof, massType: 'lumped' };
-    /* Transform to the standard symmetric problem A = M^(-1/2) K M^(-1/2). */
-    var invSqrt = zeros(n), i, j;
+    if (n === 0) return { modes: [], frequencies: [], numModes: 0, ndof: sys.ndof, massType: modelInput.massType || 'lumped' };
+    /* Cholesky M = L L^T handles the off diagonal terms of consistent mass.
+       Solve A = L^-1 K L^-T and recover phi = L^-T w. */
+    var L = matrix(n, n), invL = matrix(n, n), i, j, q;
     for (i = 0; i < n; i++) {
-      var mi = red.M[i][i];
-      if (!(mi > 1e-14)) throw new Error('MeshLab: mass matrix has a zero diagonal entry');
-      invSqrt[i] = 1 / Math.sqrt(mi);
+      for (j = 0; j <= i; j++) {
+        var value = red.M[i][j];
+        for (q = 0; q < j; q++) value -= L[i][q] * L[j][q];
+        if (i === j) {
+          if (!(value > 0)) throw new Error('MeshLab: mass matrix is not positive definite');
+          L[i][j] = Math.sqrt(value);
+        } else L[i][j] = value / L[j][j];
+      }
     }
-    var A = matrix(n, n);
-    for (i = 0; i < n; i++) for (j = 0; j < n; j++) {
-      A[i][j] = invSqrt[i] * red.K[i][j] * invSqrt[j];
+    for (j = 0; j < n; j++) for (i = 0; i < n; i++) {
+      var rhs = i === j ? 1 : 0;
+      for (q = 0; q < i; q++) rhs -= L[i][q] * invL[q][j];
+      invL[i][j] = rhs / L[i][i];
     }
+    var A = matMul(matMul(invL, red.K), transpose(invL));
     var eig = jacobiEigen(A);
     var modes = [];
     for (var k = 0; k < count; k++) {
@@ -482,7 +536,7 @@
       var omega = Math.sqrt(lambda);
       var w = eig[k].vector;
       var phiRed = zeros(n);
-      for (i = 0; i < n; i++) phiRed[i] = invSqrt[i] * w[i];
+      for (i = 0; i < n; i++) for (j = 0; j < n; j++) phiRed[i] += invL[j][i] * w[j];
       /* Mass normalise: phi^T M phi = 1. */
       var mNorm = 0;
       for (i = 0; i < n; i++) {
@@ -496,10 +550,12 @@
       }
       var phi = zeros(sys.ndof);
       for (i = 0; i < n; i++) phi[red.free[i]] = phiRed[i];
+      var Kphi = matVec(red.K, phiRed), Mphi = matVec(red.M, phiRed), residual = 0, norm = 0;
+      for (i = 0; i < n; i++) { residual += Math.pow(Kphi[i] - lambda * Mphi[i], 2); norm += Kphi[i] * Kphi[i]; }
       modes.push({
         index: k + 1, eigenvalue: lambda, omega: omega,
         frequencyHz: omega / (2 * Math.PI), period: omega > 0 ? 2 * Math.PI / omega : Infinity,
-        modeShape: Array.from(phi), shape: Array.from(phi)
+        modeShape: Array.from(phi), shape: Array.from(phi), relativeResidual: Math.sqrt(residual / Math.max(norm, 1e-30))
       });
     }
     return {
@@ -515,10 +571,16 @@
   // ---------------------------------------------------------------------------
 
   function generatePlateMesh(nx, ny, width, height, holeRadius) {
+    nx = checked(nx, 8, 'mesh columns', true); ny = checked(ny, 6, 'mesh rows', true);
+    width = checked(width, 2, 'plate width', true); height = checked(height, 1, 'plate height', true);
+    holeRadius = checked(holeRadius, 0, 'hole radius', false);
     nx = Math.max(2, Math.floor(num(nx, 8)));
     ny = Math.max(2, Math.floor(num(ny, 6)));
     width = num(width, 2); height = num(height, 1);
     holeRadius = num(holeRadius, 0);
+    if (!(width > 0 && height > 0) || holeRadius < 0 || holeRadius >= Math.min(width, height) / 2 || nx > 60 || ny > 60) {
+      throw new Error('MeshLab: invalid plate dimensions or hole radius');
+    }
     var nodes = [], id = 0, i, j;
     var xc = width / 2, yc = height / 2;
     var grid = [];
@@ -540,6 +602,16 @@
       var na = nodes[a], nb = nodes[b], nc = nodes[c];
       var area2 = (nb.x - na.x) * (nc.y - na.y) - (nc.x - na.x) * (nb.y - na.y);
       if (Math.abs(area2) < 1e-14) return;
+      if (holeRadius > 0) {
+        var points = [na, nb, nc];
+        for (var edge = 0; edge < 3; edge++) {
+          var p = points[edge], q = points[(edge + 1) % 3], vx = q.x - p.x, vy = q.y - p.y;
+          var u = clamp(((xc - p.x) * vx + (yc - p.y) * vy) / (vx * vx + vy * vy), 0, 1);
+          if (Math.hypot(p.x + u * vx - xc, p.y + u * vy - yc) < holeRadius * (1 - 1e-12)) return;
+        }
+        var centerX = (na.x + nb.x + nc.x) / 3, centerY = (na.y + nb.y + nc.y) / 3;
+        if (Math.hypot(centerX - xc, centerY - yc) < holeRadius) return;
+      }
       if (area2 < 0) { var t = b; b = c; c = t; }
       elements.push({ id: elements.length, nodes: [a, b, c] });
     }
@@ -548,6 +620,15 @@
       addTri(a, b, d);
       addTri(a, d, c);
     }
+    /* Cutting a cavity can leave nodes with no incident triangle. Remove them
+       before assembly so the mesh cannot introduce zero stiffness DOFs. */
+    var used = new Set(), remap = new Map();
+    elements.forEach(function (el) { el.nodes.forEach(function (id) { used.add(id); }); });
+    nodes = nodes.filter(function (node) { return used.has(node.id); }).map(function (node, i) {
+      remap.set(node.id, i); return { id: i, x: node.x, y: node.y };
+    });
+    elements.forEach(function (el) { el.nodes = el.nodes.map(function (id) { return remap.get(id); }); });
+    grid = grid.map(function (row) { return row.map(function (id) { return remap.has(id) ? remap.get(id) : -1; }); });
     var left = [], right = [];
     for (j = 0; j <= ny; j++) {
       left.push(grid[j][0]); right.push(grid[j][nx]);
@@ -562,9 +643,13 @@
   }
 
   function cstB(mesh, el) {
+    if (!el || !Array.isArray(el.nodes) || el.nodes.length !== 3 || el.nodes.some(function (id) { return !Number.isInteger(id) || !mesh.nodes[id]; })) {
+      throw new Error('MeshLab: triangle references a missing node');
+    }
     var p = el.nodes.map(function (k) { return mesh.nodes[k]; });
     var x1 = p[0].x, y1 = p[0].y, x2 = p[1].x, y2 = p[1].y, x3 = p[2].x, y3 = p[2].y;
     var area2 = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1);
+    if (!Number.isFinite(area2) || Math.abs(area2) <= 1e-20) throw new Error('MeshLab: triangle has zero area');
     var A = area2 / 2;
     var inv = 1 / area2;
     var b1 = y2 - y3, b2 = y3 - y1, b3 = y1 - y2;
@@ -578,11 +663,15 @@
   }
 
   function planeStressD(E, nu) {
+    E = checked(E, 2e11, 'Young modulus', true);
+    nu = checked(nu, 0.3, 'Poisson ratio', false);
+    if (!(nu > -1 && nu < 0.5)) throw new Error('MeshLab: Poisson ratio must lie between -1 and 0.5');
     var f = E / (1 - nu * nu);
     return [[f, f * nu, 0], [f * nu, f, 0], [0, 0, f * (1 - nu) / 2]];
   }
 
   function stressMeasures(sx, sy, txy) {
+    sx = checked(sx, 0, 'stress x', false); sy = checked(sy, 0, 'stress y', false); txy = checked(txy, 0, 'shear stress', false);
     var mean = (sx + sy) / 2;
     var rad = Math.sqrt(Math.pow((sx - sy) / 2, 2) + txy * txy);
     return {
@@ -592,11 +681,14 @@
     };
   }
 
-  function solvePlateCST(meshInput, material, bc, loads) {
-    var mesh = meshInput.nodes ? meshInput : generatePlateMesh(8, 6, 2, 1, 0);
+  function solvePlateCST(meshInput, material, bc, loads, options) {
+    var mesh = meshInput || generatePlateMesh(8, 6, 2, 1, 0);
+    if (!Array.isArray(mesh.nodes) || !Array.isArray(mesh.elements) || !mesh.nodes.length || !mesh.elements.length) {
+      throw new Error('MeshLab: plate needs mesh nodes and triangles');
+    }
     var mat = material || {};
-    var E = num(mat.E, 2.0e11), nu = clamp(num(mat.nu, 0.3), -0.49, 0.49);
-    var t = num(mat.t, num(mat.thickness, 0.01));
+    var E = checked(mat.E, 2.0e11, 'Young modulus', true), nu = checked(mat.nu, 0.3, 'Poisson ratio', false);
+    var t = checked(mat.t, checked(mat.thickness, 0.01, 'thickness', true), 'thickness', true);
     var D = planeStressD(E, nu);
     var N = mesh.nodes.length, ndof = 2 * N;
     var K = matrix(ndof, ndof), F = zeros(ndof), fixed = new Array(ndof);
@@ -643,7 +735,7 @@
     var anyFixed = fixed.some(function (v) { return v; });
     if (!anyFixed) {
       fixSet(mesh.leftNodes, [true, false]);
-      var bottomLeft = mesh.grid[0][0];
+      var bottomLeft = mesh.grid ? mesh.grid[0][0] : (mesh.leftNodes || [])[0];
       if (bottomLeft >= 0) fixed[2 * bottomLeft + 1] = true;
     }
     var loadCfg = loads || {};
@@ -682,7 +774,7 @@
       var n = num(q.node, -1);
       if (n >= 0 && n < N) { F[2 * n] += num(q.fx, 0); F[2 * n + 1] += num(q.fy, 0); }
     });
-    if (loadCfg.nodalArray && Array.isArray(loadCfg.nodalArray)) {
+    if (loadCfg.nodalArray && typeof loadCfg.nodalArray === 'object') {
       applyNodal(loadCfg.nodalArray.nodes || [], num(loadCfg.nodalArray.fx, 0), num(loadCfg.nodalArray.fy, 0));
     }
     var free = [], r = 0;
@@ -692,7 +784,15 @@
       Fr[i] = F[free[i]];
       for (j = 0; j < n; j++) Kr[i][j] = K[free[i]][free[j]];
     }
-    var ur = solveLinear(Kr, Fr);
+    var opt = options || {}, diagnostics = { method: 'scaled Gaussian elimination', iterations: 0 };
+    var ur;
+    if (opt.method === 'pcg') {
+      if (!Field) throw new Error('MeshLab: field tools are missing');
+      if (!solveLinear(Kr, zeros(n))) throw new Error('MeshLab: plate stiffness matrix is singular');
+      diagnostics = Field.solvePCG(Kr, Fr, opt);
+      if (!diagnostics.converged) throw new Error('MeshLab: plate PCG did not converge');
+      ur = diagnostics.solution;
+    } else ur = solveLinear(Kr, Fr);
     if (!ur) throw new Error('MeshLab: plate stiffness matrix is singular');
     var u = zeros(ndof);
     for (i = 0; i < n; i++) u[free[i]] = ur[i];
@@ -751,7 +851,11 @@
       reactions: Array.from(R), stiffnessMatrix: K,
       maxVonMises: vm.length ? Math.max.apply(null, vm) : 0,
       minVonMises: vm.length ? Math.min.apply(null, vm) : 0,
-      maxDisplacement: Math.max.apply(null, Array.from(u).map(Math.abs).concat([0])),
+      forceVector: Array.from(F), fixedMask: fixed, freeDofs: free,
+      strainEnergy: elements.reduce(function (sum, el) { return sum + el.strainEnergy; }, 0), externalWork: dot(F, u),
+      verification: verification({ F: F, fixedMask: fixed }, u, R, elements.reduce(function (sum, el) { return sum + el.strainEnergy; }, 0)),
+      diagnostics: diagnostics,
+      maxDisplacement: peakTranslation(mesh.nodes, 2, u),
       maxSigmaX: Math.max.apply(null, elements.map(function (e) { return e.stress.sigmaX; }).concat([0])),
       equilibrium: { sumFx: sumFx, sumFy: sumFy, sumRx: sumRx, sumRy: sumRy,
         residualX: sumFx + sumRx, residualY: sumFy + sumRy }
@@ -772,8 +876,6 @@
     return { name: name, dim: dim, nodes: nodes, members: members,
       material: presetMaterial(material), supports: nodes.map(function (n, i) {
         return n.support ? { node: i, type: n.support } : null;
-      }).filter(Boolean), loads: nodes.map(function (n, i) {
-        return n.load ? { node: i, f: n.load } : null;
       }).filter(Boolean) };
   }
 
@@ -912,13 +1014,21 @@
     return model;
   }
 
+  function heatFlow() {
+    if (!Field) throw new Error('MeshLab: field tools are missing');
+    return { name: 'Heat Flow on a Delaunay Mesh', dim: 2,
+      field: { mesh: Field.generateFieldMesh(14, 10, 2.4, 1.6), conductivity: 1,
+        heater: 1600, heaterRadius: 0.22, heaterX: 0.58, heaterY: 0.5, hotEdge: 100, coldEdge: 0 } };
+  }
+
   var PRESET_BUILDERS = {
     pratt: prattBridge,
     warren: warrenRoof,
     crane: cantileverCrane,
     tower: transmissionTower,
     dome: spaceTripodDome,
-    plate: perforatedPlate
+    plate: perforatedPlate,
+    heat: heatFlow
   };
 
   var PRESET_LIST = [
@@ -927,7 +1037,8 @@
     { key: 'crane', name: 'Cantilever Crane Boom', dim: 2, kind: 'truss' },
     { key: 'tower', name: 'Transmission Tower Lattice', dim: 2, kind: 'truss' },
     { key: 'dome', name: '3D Space Tripod Dome', dim: 3, kind: 'truss' },
-    { key: 'plate', name: 'Perforated Plate in Tension (Kirsch Stress Concentration)', dim: 2, kind: 'plate' }
+    { key: 'plate', name: 'Perforated Plate in Tension (Kirsch Stress Concentration)', dim: 2, kind: 'plate' },
+    { key: 'heat', name: 'Heat Flow on a Delaunay Mesh', dim: 2, kind: 'field' }
   ];
 
   function getPresets() { return PRESET_LIST.map(function (p) { return Object.assign({}, p); }); }
@@ -1030,16 +1141,24 @@
     var model = sol.model;
     var s = num(scale, 100);
     var d = model.dim;
-    var xs = model.nodes.map(function (n) { return n.x; });
-    var ys = model.nodes.map(function (n) { return n.y; });
+    function projected(n, offset) {
+      var x = n.x + (offset && offset[0] || 0) * s, y = n.y + (offset && offset[1] || 0) * s;
+      var z = (n.z || 0) + (offset && offset[2] || 0) * s;
+      return [x + (d === 3 ? 0.62 * z : 0), y + (d === 3 ? 0.30 * z : 0)];
+    }
+    var points = [];
+    model.nodes.forEach(function (n, i) { points.push(projected(n)); points.push(projected(n, sol.displacements.slice(d * i, d * i + d))); });
+    var xs = points.map(function (p) { return p[0]; });
+    var ys = points.map(function (p) { return p[1]; });
     var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
     var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
     var w = Math.max(maxX - minX, 1), h = Math.max(maxY - minY, 1);
     var pad = 40, W = 900, H = 560;
     var unit = Math.min((W - 2 * pad) / w, (H - 2 * pad) / h);
-    function project(x, y, dx, dy) {
-      var px = pad + (x - minX + (dx || 0) * s) * unit;
-      var py = H - pad - (y - minY + (dy || 0) * s) * unit;
+    function project(node, offset) {
+      var p = projected(node, offset);
+      var px = pad + (p[0] - minX) * unit;
+      var py = H - pad - (p[1] - minY) * unit;
       return [px, py];
     }
     var out = [];
@@ -1054,8 +1173,8 @@
     out.push('</g>');
     out.push('<g stroke="#5b7899" stroke-width="1.4" stroke-dasharray="5 4" fill="none" opacity="0.75">');
     model.members.forEach(function (m) {
-      var p = project(model.nodes[m.a].x, model.nodes[m.a].y);
-      var q = project(model.nodes[m.b].x, model.nodes[m.b].y);
+      var p = project(model.nodes[m.a]);
+      var q = project(model.nodes[m.b]);
       out.push('<line x1="' + fmt(p[0]) + '" y1="' + fmt(p[1]) + '" x2="' + fmt(q[0]) + '" y2="' + fmt(q[1]) + '"/>');
     });
     out.push('</g>');
@@ -1064,8 +1183,8 @@
       var na = model.nodes[m.a], nb = model.nodes[m.b];
       var ua = sol.displacements.slice(d * m.a, d * m.a + d);
       var ub = sol.displacements.slice(d * m.b, d * m.b + d);
-      var p = project(na.x, na.y, ua[0], ua[1]);
-      var q = project(nb.x, nb.y, ub[0], ub[1]);
+      var p = project(na, ua);
+      var q = project(nb, ub);
       var color = m.axialForce > 0 ? '#3987e5' : (m.axialForce < 0 ? '#e66767' : '#8898ac');
       out.push('<line x1="' + fmt(p[0]) + '" y1="' + fmt(p[1]) + '" x2="' + fmt(q[0]) + '" y2="' + fmt(q[1]) + '" stroke="' + color + '"/>');
     });
@@ -1097,6 +1216,7 @@
       },
       determinacy: sol.determinacy,
       equilibrium: sol.equilibrium,
+      verification: sol.verification,
       maxDisplacement: sol.maxDisplacement,
       strainEnergy: sol.strainEnergy,
       externalWork: sol.externalWork,
@@ -1120,7 +1240,7 @@
       },
       modes: modes ? modes.modes.map(function (m) {
         return { index: m.index, frequencyHz: m.frequencyHz, omega: m.omega,
-          eigenvalue: m.eigenvalue, modeShape: m.modeShape };
+          eigenvalue: m.eigenvalue, modeShape: m.modeShape, relativeResidual: m.relativeResidual };
       }) : []
     };
     return JSON.stringify(report, null, 2) + '\n';
@@ -1131,12 +1251,16 @@
   // ---------------------------------------------------------------------------
 
   return {
-    version: '1.0.0',
+    version: '2.0.0',
     solveTruss: solveTruss,
     analyzeSafety: analyzeSafety,
     solveModes: solveModes,
     solvePlateCST: solvePlateCST,
     generatePlateMesh: generatePlateMesh,
+    solvePCG: Field && Field.solvePCG,
+    triangulate: Field && Field.triangulate,
+    solvePoisson: Field && Field.solvePoisson,
+    generateFieldMesh: Field && Field.generateFieldMesh,
     planeStressD: planeStressD,
     stressMeasures: stressMeasures,
     getPresets: getPresets,

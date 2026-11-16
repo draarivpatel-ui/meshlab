@@ -1,82 +1,144 @@
 # MeshLab
 
-An interactive structural analysis workbench that runs entirely in the browser. MeshLab solves 2D and 3D pin jointed trusses by the direct stiffness method, checks yield and Euler buckling safety, computes natural frequencies and mode shapes, and solves a perforated 2D plate with constant strain triangles (CST) under plane stress. The interface is a blueprint engineering dashboard with a dark slate theme and an independently selected light blueprint theme.
+## See the physics. Check the math.
 
-## Run locally
+MeshLab is an engineering workbench you can open in a browser and inspect immediately. Trace the load path through a bridge, push a crane through its yield limit, reveal the stress concentration around a hole, or follow heat across an irregular triangular mesh. Every result comes from a numerical solve with inspectable measurements and a reproducibility check.
 
-No build step, no package install, and no server framework are required. The solver is a UMD module, so every file is a static asset.
+**[Open the workbench](https://aariv.me/meshlab/)**
 
-```sh
-git clone https://github.com/draarivpatel-ui/meshlab.git
-cd meshlab
-python3 -m http.server 8000
-```
+No package installation, external assets, build step, service, or runtime dependency is required. The complete application also works by opening `index.html` directly, including offline.
 
-Open `http://localhost:8000/` in a browser. Opening `index.html` directly also works because the scripts are plain classic scripts. An internet connection is only needed for the three web fonts; the UI falls back to system fonts when offline.
+## A five second demo
 
-## Test
+| One click experiment | What to inspect | Verified result at the showcase load |
+| --- | --- | --- |
+| Trace a bridge | Blue tension, red compression, support reactions | 360 kN total vertical load; 7.1582 mm peak translation |
+| Overload a crane | Dashed critical member, deformed outline, yield safety | At 5x load, Upper boom 1 governs with yield FoS 0.861538; one critical member |
+| Stress around a hole | Individual CST stress tensors and the cavity boundary | 72.9961 MPa peak von Mises; peak/nominal ratio 2.919845 |
+| Follow the heat | Interior heater, temperature, constant triangle heat flux | 165 nodes and 280 Delaunay triangles; 145.9927 C peak temperature |
 
-```sh
-node --test test.js
-```
+Move the load or heater slider to compare scenarios. Hover any member or triangle for live measurements, select it to pin those measurements, then use **Run round-trip check** to serialize and reproduce the model. The plate check compares sparse PCG against independent Gaussian elimination.
 
-The suite has 102 tests and uses only the Node built in modules. It covers linear algebra, joint equilibrium, closed form deflections, strain energy, determinacy, support behaviour, 3D systems, Euler buckling, modal orthogonality, CST patch tests, global equilibrium, Kirsch like stress concentration, all presets, and the three exporters.
+## What is implemented
 
-## How the solver works
+### Structural analysis
 
-`fem.js` exposes `MeshLab` on `window` in the browser and through `require('./fem.js')` in Node.
+- **2D and 3D pin jointed trusses:** direct stiffness assembly, scaled partial pivot Gaussian elimination, nodal translations and support reactions.
+- **Member mechanics:** axial force, stress, strain, elongation and strain energy.
+- **Safety:** material yield and Euler buckling `Pcr = pi^2 E I / (Keff L)^2`. The lower factor of safety governs. Zero force is distinguished from compression.
+- **Natural frequencies:** lumped and consistent mass formulations, full Cholesky reduction of the generalized eigenproblem, Jacobi eigenvectors and mass normalization. Every mode includes its relative eigen equation residual.
+- **Plane stress plates:** constant strain triangles, isotropic material law, consistent edge traction, principal stresses, maximum in-plane shear and von Mises stress. The browser solves the plate with sparse Jacobi PCG while the public API also exposes the direct solver.
 
-- **Direct stiffness:** each bar contributes a `2 x 2` (or `3 x 3` block) axial stiffness matrix assembled into the global system. Supports are applied by reduction, then the reduced system is solved with partial pivot Gaussian elimination. Reactions are recovered from `K u - F`.
-- **Member results:** elongation, axial force, stress, strain, and element strain energy are derived from the nodal displacements. The report also includes determinacy (`m + r - 2j` or `m + r - 3j`) and global force residuals.
-- **Safety:** every member gets a yield factor of safety and an Euler buckling factor of safety `pi^2 E I / (Keff L)^2`. The smaller of the two governs.
-- **Modes:** a lumped or consistent mass matrix is reduced to the free degrees of freedom, transformed to a symmetric standard eigenproblem, and diagonalised with the Jacobi rotation method. Mode shapes are mass normalised and returned with frequency, angular frequency, eigenvalue, and period.
-- **Plate:** `generatePlateMesh` builds a structured grid of two triangles per cell and removes elements inside a circular hole. Each CST element uses a plane stress constitutive matrix `D`, a constant strain displacement matrix `B`, and `K_e = B^T D B t A`. Element stress, principal stresses, maximum shear, and von Mises stress are post processed. Applied edge traction is distributed consistently along boundary segments, which reproduces exact uniform uniaxial stress and gives a stress concentration above 2x nominal at the hole.
+### Scalar field analysis
 
-All quantities are SI: metres, newtons, pascals, kilograms, hertz, and joules. The UI converts to kN, MPa, and mm for display.
+- **Delaunay meshing:** deterministic convex-hull sweep and Lawson edge-flip triangulation with normalized geometry, duplicate point removal, hull extraction, positive triangle winding and minimum angle reporting.
+- **Poisson FEM:** linear scalar triangles solve `-div(k grad T) = q`. Nonzero prescribed boundary values enter the reduced right hand side correctly; unconstrained edges have the natural zero flux condition.
+- **Sparse PCG:** compressed sparse row multiplication, Jacobi preconditioning, symmetry and positive curvature checks, finite iteration limits, and a recomputed actual residual before reporting convergence.
+- **Heat flow:** prescribed 100 C and 0 C edges, insulated top and bottom, and an adjustable interior Gaussian heater. Flux is `-k grad T` and heat balance is reported per unit depth.
+
+All structural engine quantities use SI units: m, N, Pa, kg, Hz and J. Display values use mm, kN and MPa. The heat experiment uses C, W/m2 and W/m per unit depth.
 
 ## Presets
 
-| Key | Structure | Solver |
+| Key | Model | Formulation |
 | --- | --- | --- |
 | `pratt` | Pratt Bridge Truss (7-Bay), 16 nodes, 34 members | 2D truss |
 | `warren` | Warren Roof Truss | 2D truss |
 | `crane` | Cantilever Crane Boom | 2D truss |
 | `tower` | Transmission Tower Lattice | 2D truss |
-| `dome` | 3D Space Tripod Dome, isometric projection | 3D truss |
-| `plate` | Perforated Plate in Tension (Kirsch Stress Concentration), 336 nodes, 580 triangles | CST plane stress |
+| `dome` | 3D Space Tripod Dome with isometric projection | 3D truss |
+| `plate` | Perforated plate, 336 nodes, 580 triangles | CST plane stress |
+| `heat` | Irregular mesh, 165 nodes, 280 triangles | Delaunay Poisson FEM |
 
-## Interface
+The force count in `m + r - dj` is reported alongside the solved stiffness system. A nonnegative count alone is not a proof of stability. Singular direct systems raise a descriptive error.
 
-- **Views:** axial force (diverging blue tension and red compression, line weight by magnitude), von Mises stress (single hue sequential ramp), deformed shape (undeformed ghost plus exaggerated shape), and modal shape (animated mode with a phase scrubber).
-- **Controls:** structure preset, view, deformation scale from 1x to 500x, ghost geometry, reaction arrows, grid, and table filter.
-- **Interaction:** hover or keyboard focus on any member or triangle opens a tooltip with the full numeric result. The sortable result table is an equivalent text view, legends always carry text labels, and the safety meter ships an icon plus label. The light and dark themes use independently validated palette steps.
-- **Results:** stat tiles, global equilibrium, determinacy, a factor of safety meter with a FoS 1.0 limit, and natural frequency bars.
+## Verification
+
+```sh
+node --test --test-reporter=spec test.js numerics.test.js ui.test.js
+```
+
+**168 tests passed, 0 failed, 0 skipped.** The suites contain 102 structural/export checks, 42 numerical and edge case checks, and 24 DOM/interface checks. All test code uses built in Node modules.
+
+| Reproduced check | Verified value |
+| --- | --- |
+| Holed plate peak/nominal stress | 2.919844677 |
+| Holed plate PCG convergence | 285 iterations; relative residual below 1e-12 |
+| Delaunay mesh area | 3.84 m2 |
+| Delaunay minimum angle | 33.6772 degrees |
+| Harmonic field `T = 100(1 - x / width)` | Maximum nodal error below 4e-10 C on the default irregular mesh |
+| Consistent mass bridge modes | Full generalized eigen residual below 1e-8; mutual mass orthogonality checked |
+| Primary, secondary and status text in both themes | Automated contrast checks require at least 4.5:1 against the panel background |
+
+DOM tests load the actual HTML and all browser scripts into a browser contract fixture. They exercise all seven presets, controls, numeric SVG attributes, mode animation, keyboard inspection, download generation, error recovery and round-trip checks. They verify bindings and behavior; browser layout and screen rendering are separate from this fixture.
+
+Syntax can be checked without running the app:
+
+```sh
+node --check field.js
+node --check fem.js
+node --check app.js
+node --check test.js
+node --check numerics.test.js
+node --check dom-fixture.js
+node --check ui.test.js
+```
+
+All seven scripts pass syntax checks.
+
+## Interface and accessibility
+
+- Four instant experiments lead directly to real solved models.
+- The load sweep covers 0x to 5x, including a fully unloaded state.
+- The SVG scales without raster DPI loss. Force strokes and member hit targets keep their screen width as the viewport changes.
+- One diagram tab stop avoids hundreds of sequential stops. Arrow keys move between results, Home/End jump to the extremes, Enter/Space pin a result, and Escape clears inspection.
+- Text measurements duplicate every color encoding. Critical members have a dashed mark and a text state.
+- The result table is sortable, reports sort direction, and can be scrolled with keyboard focus.
+- Tooltips stay inside the plot; the pinned inspector remains readable on small screens.
+- Modal animation uses elapsed time, one animation loop and a stable view box. Hiding the page stops it; reduced motion uses the phase slider.
+- Light and dark themes have explicit palettes, visible focus states and automated text contrast checks.
 
 ## Exports
 
-| Button | Truss presets | Plate preset |
-| --- | --- | --- |
-| `.INP` | CalculiX and Abaqus style deck with `*NODE`, `*ELEMENT`, `*MATERIAL`, `*BOUNDARY`, `*CLOAD`, and `*END STEP` | `CPS3` plane stress deck with `*SOLID SECTION`, consistent edge traction, and output requests |
-| `.SVG` | Standalone deformed shape SVG with ghost geometry, colour coded members, and the deformation scale | Standalone von Mises contour SVG with one filled polygon per triangle |
-| `.JSON` | Full structural report with nodes, members, safety, determinacy, equilibrium, and modes | Full CST report with mesh metadata, nodal displacements, reactions, element stress tensors, and equilibrium |
+| Export | Trusses | Plate | Heat field |
+| --- | --- | --- | --- |
+| `.INP` | CalculiX / Abaqus style truss input deck | `CPS3` plate deck with the actual constrained DOFs and one consolidated load per DOF | Unavailable |
+| `.SVG` | Standalone deformed result, including projected z coordinates | Standalone deformed von Mises contour | Standalone temperature contour |
+| `.JSON` | Reactions, member results, safety, modes and verification | Nodal results, stress tensors, forces, constraints and PCG diagnostics | Mesh, temperatures, flux, balance and PCG diagnostics |
 
-Exports are generated in the browser with the Blob API and never leave the machine.
+Downloads are generated locally. Object URLs are released after downloading.
+
+## Running and embedding
+
+Open `index.html`, or serve this directory with any static file server. GitHub Pages needs no build command; `.nojekyll` is included.
+
+Browser script order is `field.js`, `fem.js`, then `app.js`. In Node:
+
+```js
+const MeshLab = require('./fem.js');
+const model = MeshLab.getPreset('pratt');
+const result = MeshLab.solveTruss(model);
+console.log(result.maxDisplacement, result.verification);
+```
+
+## Modeling scope
+
+The structural models are linear elastic axial trusses and plane stress CST plates. They do not include beam bending, plastic redistribution, contact or large deformation. Euler buckling and yield ratios are screening calculations within those assumptions. Mode display amplitude is an inspection setting, not a prediction of forced vibration amplitude.
+
+The perforated plate has finite width and a stair step approximation of the hole. Its measured concentration is compared with nominal membrane stress; it is not claimed as an exact solution for an infinite circular-hole plate. The Delaunay field mesh covers a convex rectangular domain and the Poisson source is integrated by triangle centroid quadrature.
 
 ## Files
 
-```
-index.html    Static shell and semantic controls
-style.css     Blueprint theme, layout, SVG mark specs, and accessibility states
-app.js        UI state, SVG rendering, tooltips, table, theme, and exports
-fem.js        UMD finite element solver, presets, and truss exporters
-test.js       Node regression suite
-.nojekyll     Disables Jekyll processing for static hosting
-LICENSE       MIT license
-```
-
-## Accessibility
-
-Colour never carries meaning alone: force and stress states have text labels, the table view repeats the numeric data, and status colours come with an icon and label. Focusable SVG hit targets are larger than the visible marks and show the same tooltip as pointer hover. Reduced motion preferences are honoured, and the light theme is a separate validated palette rather than an inversion of the dark theme.
+| File | Purpose |
+| --- | --- |
+| `index.html`, `style.css` | Static semantic shell and responsive themes |
+| `app.js` | Scenario state, SVG rendering, inspection, verification and exports |
+| `fem.js` | Structural solver, presets and public UMD API |
+| `field.js` | Delaunay mesh, sparse PCG and scalar Poisson FEM |
+| `test.js` | Structural and export regression tests |
+| `numerics.test.js` | Solver edge cases and independent math checks |
+| `ui.test.js`, `dom-fixture.js` | Actual shell/browser-script contract tests |
+| `DEVPOST_UPGRADE.md` | Submission narrative with reproduced numbers |
 
 ## License
 

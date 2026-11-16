@@ -27,15 +27,17 @@
     light: { tension: '#2a78d6', compression: '#e34948', accent: '#2a78d6',
       load: '#1baf7a', reaction: '#eb6834', neutral: '#7b8a9c' }
   };
-  var STATUS = { good: '#0ca30c', warning: '#fab219', serious: '#ec835a', critical: '#d03b3b' };
+  var STATUS = { good: 'var(--good)', warning: 'var(--warning)', serious: 'var(--serious)', critical: 'var(--critical)' };
 
   var state = {
     key: 'pratt', kind: 'truss', model: null, solution: null,
-    safety: null, modes: null, plate: null,
+    safety: null, modes: null, plate: null, field: null, load: 1,
     view: 'force', scale: 100, ghost: true, reactions: true, grid: true,
     theme: 'dark', modeIndex: 0, phase: 0, playing: false,
-    filter: 'all', sortKey: 'id', sortDir: 1, hovered: -1
+    filter: 'all', sortKey: 'id', sortDir: 1, hovered: -1, pinned: -1
   };
+  var inspectionTargets = [], animationFrame = null, previousTime = null;
+  var reducedMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ---------- small DOM helpers, all label text goes through textContent ---------- */
 
@@ -88,14 +90,22 @@
     var preset = M.getPresets().filter(function (p) { return p.key === key; })[0];
     state.kind = preset ? preset.kind : 'truss';
     var model = M.getPreset(key);
+    if (model.nodes) model.nodes.forEach(function (n) { if (n.load) n.load = n.load.map(function (v) { return v * state.load; }); });
+    if (model.plate) Object.keys(model.plate.loads).forEach(function (k) {
+      if (typeof model.plate.loads[k] === 'number') model.plate.loads[k] *= state.load;
+    });
     state.model = model;
-    state.plate = null; state.solution = null;
+    state.plate = null; state.solution = null; state.field = null;
     state.safety = null; state.modes = null;
     if (state.kind === 'plate') {
       state.plate = M.solvePlateCST(model.plate.mesh, model.plate.material,
-        model.plate.bc, model.plate.loads);
-      if (state.view === 'modes') { state.view = 'stress'; syncViewSelect(); }
+        model.plate.bc, model.plate.loads, { method: 'pcg', tolerance: 1e-12 });
+      if (state.view === 'modes' || state.view === 'force') { state.view = 'stress'; syncViewSelect(); }
       clear($('mode-select'));
+    } else if (state.kind === 'field') {
+      model.field.heater *= state.load;
+      state.field = solveField(model.field.mesh, model.field);
+      state.view = 'stress'; syncViewSelect();
     } else {
       var sol = M.solveTruss(model);
       state.solution = sol;
@@ -105,8 +115,35 @@
     state.modeIndex = 0;
     state.phase = 0;
     state.hovered = -1;
+    state.pinned = -1;
     state.sortKey = 'id';
     state.sortDir = 1;
+  }
+
+  function solveField(mesh, config) {
+    return M.solvePoisson(mesh, { conductivity: config.conductivity,
+      source: function (x, y) { return config.heater * Math.exp(-Math.pow((x - mesh.width * config.heaterX) / config.heaterRadius, 2) - Math.pow((y - mesh.height * config.heaterY) / config.heaterRadius, 2)); },
+      boundary: function (node) { if (node.x === 0) return config.hotEdge; if (Math.abs(node.x - mesh.width) < 1e-12) return config.coldEdge; }
+    });
+  }
+
+  function updateAnalysis(key) {
+    var snapshot = Object.assign({}, state);
+    snapshot.load = state.solvedLoad === undefined ? 1 : state.solvedLoad; snapshot.playing = false;
+    stopAnimation(); hideTooltip();
+    try {
+      compute(key); renderAll();
+      state.solvedLoad = state.load;
+      $('solve-status').textContent = 'SOLVED';
+      $('solve-status').setAttribute('data-state', 'good');
+    } catch (error) {
+      Object.assign(state, snapshot);
+      $('preset-select').value = state.key;
+      $('load-range').value = String(state.load); $('load-output').textContent = state.load.toFixed(1) + 'x';
+      $('solve-status').textContent = 'CHECK INPUT';
+      $('solve-status').setAttribute('data-state', 'critical');
+      $('status-message').textContent = error.message;
+    }
   }
 
   function maxAbsMemberForce() {
@@ -135,7 +172,7 @@
 
   function buildProjection() {
     var pts = [], i;
-    var s = state.scale;
+    var s = state.view === 'deformed' ? state.scale : 0;
     var d = state.model.dim;
     var displ = null;
     if (state.kind === 'plate') {
@@ -152,11 +189,13 @@
         pts.push(rawPoint(ns[i], displ[d * i] * s, displ[d * i + 1] * s,
           d === 3 ? displ[d * i + 2] * s : 0));
         if (state.view === 'modes') {
-          var amp = Math.max(state.solution.maxDisplacement, 1e-9) * 0.55;
-          var mx = modeDisplacement(amp, d * i), my = modeDisplacement(amp, d * i + 1),
-            mz = d === 3 ? modeDisplacement(amp, d * i + 2) : 0;
-          pts.push(rawPoint(ns[i], mx, my, mz));
-          pts.push(rawPoint(ns[i], -mx, -my, -mz));
+          var amp = modalAmplitude();
+          var savedPhase = state.phase;
+          state.phase = 0;
+          pts.push(rawPoint(ns[i], modeDisplacement(amp, d * i), modeDisplacement(amp, d * i + 1), d === 3 ? modeDisplacement(amp, d * i + 2) : 0));
+          state.phase = 180;
+          pts.push(rawPoint(ns[i], modeDisplacement(amp, d * i), modeDisplacement(amp, d * i + 1), d === 3 ? modeDisplacement(amp, d * i + 2) : 0));
+          state.phase = savedPhase;
         }
       }
     }
@@ -188,6 +227,11 @@
     if (peak <= 0) return 0;
     return (raw / peak) * Math.cos(state.phase * Math.PI / 180) * i;
   }
+  function modalAmplitude() {
+    var nodes = state.solution.nodes, xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+    nodes.forEach(function (n) { xmin = Math.min(xmin, n.x); xmax = Math.max(xmax, n.x); ymin = Math.min(ymin, n.y); ymax = Math.max(ymax, n.y); });
+    return Math.max(xmax - xmin, ymax - ymin, 1) * 0.055 * state.scale / 100;
+  }
 
   function memberEndOffsets(memberIndex) {
     var sol = state.solution;
@@ -202,7 +246,7 @@
       ];
     }
     if (state.view === 'modes') {
-      var amp = Math.max(state.solution.maxDisplacement, 1e-9) * 0.55;
+      var amp = modalAmplitude();
       return [
         [modeDisplacement(amp, d * m.a), modeDisplacement(amp, d * m.a + 1),
           d === 3 ? modeDisplacement(amp, d * m.a + 2) : 0],
@@ -234,8 +278,10 @@
     if (!node) return;
     var wrap = $('canvas-wrap');
     var rect = wrap && wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : { left: 0, top: 0 };
-    var x = (evt && evt.clientX ? evt.clientX - rect.left : 24) + 14;
-    var y = (evt && evt.clientY ? evt.clientY - rect.top : 24) + 14;
+    var x = (evt && typeof evt.clientX === 'number' ? evt.clientX - rect.left : 24) + 14;
+    var y = (evt && typeof evt.clientY === 'number' ? evt.clientY - rect.top : 24) + 14;
+    x = clamp(x, 8, Math.max(8, (rect.width || 800) - (node.offsetWidth || 240) - 8));
+    y = clamp(y, 8, Math.max(8, (rect.height || 500) - (node.offsetHeight || 180) - 8));
     node.setAttribute('style', 'left:' + x + 'px;top:' + y + 'px;');
   }
   function showTooltip(title, rows, evt) {
@@ -260,13 +306,54 @@
     if (node) node.setAttribute('hidden', '');
   }
   function attachTip(el, title, rowsFn) {
-    function open(evt) { showTooltip(title, rowsFn(), evt); }
+    var index = inspectionTargets.length;
+    inspectionTargets.push({ element: el, title: title, rows: rowsFn });
+    el.setAttribute('tabindex', index === 0 ? '0' : '-1');
+    el.setAttribute('role', 'button');
+    el.setAttribute('data-inspect', String(index));
+    el.setAttribute('aria-pressed', state.pinned === index ? 'true' : 'false');
+    function open(evt) {
+      showTooltip(title, rowsFn(), evt);
+      if (state.pinned < 0) renderInspection(title, rowsFn());
+    }
     ['pointermove', 'pointerenter', 'focus'].forEach(function (ev) {
       el.addEventListener(ev, open);
     });
     ['pointerleave', 'blur'].forEach(function (ev) {
       el.addEventListener(ev, hideTooltip);
     });
+    function pin() {
+      state.pinned = state.pinned === index ? -1 : index;
+      inspectionTargets.forEach(function (target, i) { target.element.setAttribute('aria-pressed', i === state.pinned ? 'true' : 'false'); });
+      renderInspection(title, rowsFn()); hideTooltip();
+    }
+    el.addEventListener('click', pin);
+    el.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); pin(); }
+      else if (/^Arrow(Left|Right|Up|Down)$/.test(event.key) || event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        var delta = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+        var next = event.key === 'Home' ? 0 : event.key === 'End' ? inspectionTargets.length - 1 :
+          (index + delta + inspectionTargets.length) % inspectionTargets.length;
+        inspectionTargets.forEach(function (target, i) { target.element.setAttribute('tabindex', i === next ? '0' : '-1'); });
+        inspectionTargets[next].element.focus();
+      } else if (event.key === 'Escape') {
+        state.pinned = -1; hideTooltip();
+        inspectionTargets.forEach(function (target) { target.element.setAttribute('aria-pressed', 'false'); });
+        resetInspection();
+      }
+    });
+  }
+  function renderInspection(title, rows) {
+    var node = $('inspector'); clear(node);
+    node.appendChild(hEl('span', 'eyebrow', state.pinned >= 0 ? 'PINNED RESULT / ' + title : 'LIVE RESULT / ' + title));
+    var values = hEl('div', 'inspection-values');
+    rows.forEach(function (row) { var cell = hEl('div'); cell.appendChild(hEl('span', 'inspection-name', row.name)); cell.appendChild(hEl('strong', null, row.value)); values.appendChild(cell); });
+    node.appendChild(values);
+  }
+  function resetInspection() {
+    clear($('inspector')); $('inspector').appendChild(hEl('span', 'eyebrow', 'LIVE INSPECTOR'));
+    $('inspector').appendChild(hEl('p', null, 'Hover a result or select it to pin its measurements.'));
   }
 
   /* ---------- SVG primitives ---------- */
@@ -309,7 +396,7 @@
     var line = svgEl('line', { x1: fixed(tail[0], 2), y1: fixed(tail[1], 2),
       x2: fixed(tip[0], 2), y2: fixed(tip[1], 2), stroke: color,
       'stroke-width': 2, 'stroke-linecap': 'round' });
-    line.setAttribute('class', textClass === 'svg-reaction-text' ? 'svg-reaction' : 'svg-load');
+    line.setAttribute('class', textClass === 'svg-field-flux' ? 'svg-field-flux' : textClass === 'svg-reaction-text' ? 'svg-reaction' : 'svg-load');
     g.appendChild(line);
     var bx = tip[0] - ux * 9, by = tip[1] - uy * 9;
     var px = -uy * 4.5, py = ux * 4.5;
@@ -317,7 +404,7 @@
       fixed(bx + px, 2) + ',' + fixed(by + py, 2) + ' ' +
       fixed(bx - px, 2) + ',' + fixed(by - py, 2);
     var head = svgEl('polygon', { points: pts, fill: color });
-    head.setAttribute('class', textClass === 'svg-reaction-text' ? 'svg-reaction-head' : 'svg-load-head');
+    head.setAttribute('class', textClass === 'svg-field-flux' ? 'svg-field-flux-head' : textClass === 'svg-reaction-text' ? 'svg-reaction-head' : 'svg-load-head');
     g.appendChild(head);
     if (label) {
       var tx = svgEl('text', { 'class': textClass || 'svg-label',
@@ -383,7 +470,7 @@
         x2: fixed(q1[0], 2), y2: fixed(q1[1], 2),
         stroke: memberColor(m), 'stroke-width': fixed(width, 2),
         'stroke-linecap': 'round' });
-      line.setAttribute('class', 'svg-member' + (state.hovered === i ? ' hovered' : ''));
+      line.setAttribute('class', 'svg-member' + (state.hovered === i ? ' hovered' : '') + (safetyById[m.id] && safetyById[m.id].critical ? ' is-critical' : ''));
       memberG.appendChild(line);
 
       var hit = svgEl('line', { x1: fixed(q0[0], 2), y1: fixed(q0[1], 2),
@@ -399,7 +486,8 @@
             { value: fixed(mm.length, 3) + ' m', name: 'Length' },
             { value: sr && isFinite(sr.fosGoverning) ? fixed(sr.fosGoverning, 2) : 'n/a',
               name: 'FoS governing' },
-            { value: mm.axialForce >= 0 ? 'TENSION' : 'COMPRESSION', name: 'State' }
+            { value: Math.abs(mm.axialForce) <= 1e-9 ? 'ZERO FORCE' : mm.axialForce > 0 ? 'TENSION' : 'COMPRESSION', name: 'State' },
+            { value: sr ? sr.governingMode.toUpperCase() : 'n/a', name: 'Governing check' }
           ];
         });
         hit.addEventListener('focus', function () { state.hovered = idx; });
@@ -422,7 +510,7 @@
           sol.displacements[d * i + 1] * state.scale,
           d === 3 ? sol.displacements[d * i + 2] * state.scale : 0];
       } else if (state.view === 'modes') {
-        var amp = Math.max(sol.maxDisplacement, 1e-9) * 0.55;
+        var amp = modalAmplitude();
         off = [modeDisplacement(amp, d * i), modeDisplacement(amp, d * i + 1),
           d === 3 ? modeDisplacement(amp, d * i + 2) : 0];
       }
@@ -436,13 +524,14 @@
         nodeG.appendChild(svgEl('circle', { cx: fixed(p[0], 2), cy: fixed(p[1], 2),
           r: 3.2, 'class': 'svg-node' }));
       }
-      var lx = n.load[0], ly = n.load[1];
+      var lx = n.load[0] + (d === 3 ? 0.62 * n.load[2] : 0), ly = n.load[1] + (d === 3 ? 0.30 * n.load[2] : 0);
       if (Math.abs(lx) + Math.abs(ly) > 1e-9) {
         drawArrow(arrowG, base, [lx / maxL, ly / maxL], pal().load,
           fixed(Math.sqrt(lx * lx + ly * ly) / 1000, 1) + ' kN', true, 'svg-label');
       }
-      if (state.reactions && (Math.abs(n.reaction[0]) + Math.abs(n.reaction[1])) > 1e-6) {
-        drawArrow(arrowG, base, [n.reaction[0] / maxR, n.reaction[1] / maxR],
+      var rx = n.reaction[0] + (d === 3 ? 0.62 * n.reaction[2] : 0), ry = n.reaction[1] + (d === 3 ? 0.30 * n.reaction[2] : 0);
+      if (state.reactions && (Math.abs(rx) + Math.abs(ry)) > 1e-6) {
+        drawArrow(arrowG, base, [rx / maxR, ry / maxR],
           pal().reaction, null, false, 'svg-reaction-text');
       }
     });
@@ -472,6 +561,7 @@
     var hitG = svgEl('g');
     var s = state.scale;
     var deformed = state.view === 'deformed';
+    var boundaryEdges = new Map();
     p.elements.forEach(function (e) {
       var ns = e.nodes.map(function (k) { return p.nodes[k]; });
       var pts = ns.map(function (n) {
@@ -505,9 +595,17 @@
         });
       })(e);
       hitG.appendChild(hit);
+      if (state.ghost && deformed) for (var edge = 0; edge < 3; edge++) {
+        var a = e.nodes[edge], b = e.nodes[(edge + 1) % 3], key = Math.min(a, b) + ':' + Math.max(a, b);
+        if (boundaryEdges.has(key)) boundaryEdges.delete(key); else boundaryEdges.set(key, [a, b]);
+      }
     });
     svg.appendChild(triG);
     svg.appendChild(edgeG);
+    boundaryEdges.forEach(function (edge) {
+      var a = pr.px(rawPoint(p.nodes[edge[0]], 0, 0, 0)), b = pr.px(rawPoint(p.nodes[edge[1]], 0, 0, 0));
+      svg.appendChild(svgEl('line', { x1: fixed(a[0], 2), y1: fixed(a[1], 2), x2: fixed(b[0], 2), y2: fixed(b[1], 2), 'class': 'svg-ghost' }));
+    });
     if (mesh.holeRadius > 0) {
       var holeCenter = pr.px(rawPoint({ x: mesh.width / 2, y: mesh.height / 2 }, 0, 0, 0));
       var holeEdge = pr.px(rawPoint({ x: mesh.width / 2 + mesh.holeRadius,
@@ -549,7 +647,10 @@
   function renderCanvas() {
     var svg = $('structure-svg');
     if (!svg) return;
+    var active = document.activeElement && document.activeElement.getAttribute && document.activeElement.getAttribute('data-inspect');
+    if (state.kind === 'field') { renderFieldCanvas(); restoreFocus(active); return; }
     clear(svg);
+    inspectionTargets = [];
     var pr = buildProjection();
     svg.setAttribute('viewBox', '0 0 ' + pr.W + ' ' + pr.H);
     svg.setAttribute('aria-label', (state.kind === 'plate' ? 'Plate' : 'Truss') +
@@ -557,6 +658,13 @@
     drawGrid(svg, pr);
     if (state.kind === 'plate') renderPlateCanvas(svg, pr);
     else renderTrussCanvas(svg, pr);
+    restoreFocus(active);
+  }
+  function restoreFocus(index) {
+    if (index !== null && index !== undefined && inspectionTargets[Number(index)]) {
+      inspectionTargets.forEach(function (target, i) { target.element.setAttribute('tabindex', String(i) === index ? '0' : '-1'); });
+      inspectionTargets[Number(index)].element.focus();
+    }
   }
 
   /* ---------- header and stat tiles ---------- */
@@ -566,9 +674,9 @@
     $('model-title').textContent = p.name;
     var caption;
     if (state.kind === 'plate') {
-      caption = '2D plane stress CST mesh. Kirsch stress concentration around a circular hole. SI units.';
+      caption = 'Finite width plane stress plate with a stair step hole boundary. CST stress tensors, SI units.';
     } else if (state.model.dim === 3) {
-      caption = '3D space frame with isometric projection. Direct stiffness solution, SI units.';
+      caption = '3D pin jointed truss with isometric projection. Direct stiffness solution, SI units.';
     } else {
       caption = '2D pin jointed truss. Direct stiffness solution, SI units.';
     }
@@ -595,11 +703,11 @@
       var p = state.plate;
       var nominal = Math.abs(state.model.plate.loads.rightNodesForce) /
         (p.mesh.height * p.material.t);
-      var ratio = nominal > 0 ? p.maxVonMises / nominal : 0;
+      var ratio = nominal > 0 ? p.maxVonMises / nominal : null;
       g.appendChild(statTile('PEAK VON MISES', fixed(p.maxVonMises / 1e6, 2), 'MPa',
         'element maximum, sequential ramp', true));
-      g.appendChild(statTile('KIRSCH RATIO', fixed(ratio, 3), 'x',
-        'peak / nominal membrane stress'));
+      g.appendChild(statTile('CONCENTRATION RATIO', ratio === null ? 'unloaded' : fixed(ratio, 3), ratio === null ? '' : 'x',
+        'finite width, stair step hole boundary'));
       g.appendChild(statTile('MAX DISPLACEMENT', fixed(p.maxDisplacement * 1000, 4), 'mm',
         'nodal translation magnitude'));
       g.appendChild(statTile('MAX SIGMA X', fixed(p.maxSigmaX / 1e6, 2), 'MPa',
@@ -615,9 +723,9 @@
     var peakStress = 0;
     sol.members.forEach(function (m) { peakStress = Math.max(peakStress, Math.abs(m.stress)); });
     g.appendChild(statTile('MAX DISPLACEMENT', fixed(sol.maxDisplacement * 1000, 4), 'mm',
-      'exaggerated ' + state.scale + 'x in the canvas', true));
+      state.view === 'deformed' ? 'exaggerated ' + state.scale + 'x in the canvas' : 'maximum nodal translation', true));
     g.appendChild(statTile('MIN FACTOR OF SAFETY',
-      isFinite(sf.minFos) ? fixed(sf.minFos, 3) : 'n/a', '',
+      isFinite(sf.minFos) ? fixed(sf.minFos, 3) : 'unloaded', '',
       sf.criticalCount + ' critical members'));
     g.appendChild(statTile('STRAIN ENERGY', fixed(sol.strainEnergy, 4), 'J',
       'sum of 0.5 N delta'));
@@ -647,7 +755,7 @@
       appendRow(tb, 'Residual Z', signed((e.residualZ || 0) / 1000, 6) + ' kN');
       appendRow(tb, 'External work', fixed(state.solution.externalWork, 6) + ' J');
     }
-    var res = Math.max(Math.abs(e.residualX || 0), Math.abs(e.residualY || 0));
+    var res = Math.max(Math.abs(e.residualX || 0), Math.abs(e.residualY || 0), Math.abs(e.residualZ || 0));
     var badge = $('equilibrium-badge');
     badge.textContent = res < 1e-3 ? 'BALANCED' : 'CHECK';
     badge.setAttribute('data-state', res < 1e-3 ? 'good' : 'critical');
@@ -685,10 +793,10 @@
       var p = state.plate;
       var ratio = p.maxVonMises / (Math.abs(state.model.plate.loads.rightNodesForce) /
         (p.mesh.height * p.material.t));
-      var fos = 2.5e8 / p.maxVonMises;
+      var fos = state.model.material.sigmaYield / p.maxVonMises;
       var top = hEl('div', 'meter-top');
       top.appendChild(hEl('span', null, 'Yield FoS at peak stress'));
-      top.appendChild(hEl('strong', null, fixed(fos, 3)));
+      top.appendChild(hEl('strong', null, isFinite(fos) ? fixed(fos, 3) : 'unloaded'));
       box.appendChild(top);
       var track = hEl('div', 'meter-track');
       var fill = hEl('div', 'meter-fill');
@@ -709,8 +817,8 @@
       ic.setAttribute('style', 'color:' + (fos >= 1.5 ? STATUS.good :
         fos >= 1 ? STATUS.warning : STATUS.critical) + ';font-family:var(--font-mono);font-size:10px;');
       st.appendChild(ic);
-      st.appendChild(hEl('span', null, 'Peak / nominal ratio ' + fixed(ratio, 3) +
-        '. Stress concentration at the hole boundary.'));
+      st.appendChild(hEl('span', null, p.maxVonMises > 0 ? 'Peak / nominal ratio ' + fixed(ratio, 3) +
+        '. Approximate finite width hole boundary.' : 'No applied load. Stress and displacement are zero.'));
       box.appendChild(st);
       badge.textContent = fos >= 1 ? 'OK' : 'CRITICAL';
       badge.setAttribute('data-state', fos >= 1 ? 'good' : 'critical');
@@ -720,7 +828,7 @@
     var fos = sf.minFos;
     var top = hEl('div', 'meter-top');
     top.appendChild(hEl('span', null, 'Governing minimum'));
-    top.appendChild(hEl('strong', null, isFinite(fos) ? fixed(fos, 3) : 'n/a'));
+    top.appendChild(hEl('strong', null, isFinite(fos) ? fixed(fos, 3) : 'unloaded'));
     box.appendChild(top);
     var track = hEl('div', 'meter-track');
     var fill = hEl('div', 'meter-fill');
@@ -754,7 +862,7 @@
     clear(box);
     if (state.kind === 'plate' || !state.modes || !state.modes.modes.length) {
       box.appendChild(hEl('p', 'panel-sub',
-        'Eigenmodes are computed for the truss and frame presets. The plate view uses the CST contour.'));
+        'Eigenmodes are computed for the truss presets. The plate view uses the CST contour.'));
       return;
     }
     var modes = state.modes.modes;
@@ -808,7 +916,7 @@
         row.appendChild(legendSwatch(pal().load, 'APPLIED EDGE TRACTION', true));
         row.appendChild(legendSwatch(pal().reaction, 'SUPPORT REACTION', true));
       }
-      if (state.ghost) row.appendChild(legendSwatch('var(--ghost)', 'UNDEFORMED GHOST', true));
+      if (state.ghost && (state.kind !== 'plate' || state.view === 'deformed')) row.appendChild(legendSwatch('var(--ghost)', 'UNDEFORMED GHOST', true));
       return;
     }
     if (state.view === 'force') {
@@ -824,6 +932,7 @@
     }
     row.appendChild(legendSwatch(pal().load, 'APPLIED LOAD', true));
     row.appendChild(legendSwatch(pal().reaction, 'REACTION', true));
+    if (state.safety && state.safety.criticalCount) row.appendChild(legendSwatch('var(--critical)', 'DASHED = BELOW SAFETY LIMIT', true));
   }
 
   /* ---------- mode scrubber ---------- */
@@ -833,7 +942,7 @@
     var show = state.view === 'modes' && state.kind !== 'plate';
     if (!show) {
       scrub.setAttribute('hidden', '');
-      state.playing = false;
+      stopAnimation();
       var pb = $('mode-play');
       pb.setAttribute('aria-pressed', 'false');
       pb.textContent = 'PLAY';
@@ -841,28 +950,40 @@
     }
     scrub.removeAttribute('hidden');
     var sel = $('mode-select');
-    clear(sel);
-    state.modes.modes.forEach(function (m, i) {
-      var o = hEl('option', null, 'Mode ' + m.index + ' / ' + fixed(m.frequencyHz, 2) + ' Hz');
-      o.setAttribute('value', String(i));
-      if (i === state.modeIndex) o.setAttribute('selected', 'selected');
-      sel.appendChild(o);
-    });
-    sel.setAttribute('value', String(state.modeIndex));
-    $('mode-phase').setAttribute('value', String(Math.round(state.phase)));
+    if (sel.getAttribute('data-mode-key') !== state.key || sel.getElementsByTagName('option').length !== state.modes.modes.length) {
+      clear(sel);
+      state.modes.modes.forEach(function (m, i) {
+        var o = hEl('option', null, 'Mode ' + m.index + ' / ' + fixed(m.frequencyHz, 2) + ' Hz');
+        o.setAttribute('value', String(i)); sel.appendChild(o);
+      });
+      sel.setAttribute('data-mode-key', state.key);
+    }
+    sel.value = String(state.modeIndex);
+    $('mode-phase').value = String(Math.round(state.phase));
     var cur = state.modes.modes[state.modeIndex];
     $('mode-readout').textContent = 'f = ' + fixed(cur.frequencyHz, 2) +
       ' Hz / T = ' + fixed(cur.period * 1000, 2) + ' ms / phase ' +
       Math.round(state.phase) + ' deg';
   }
 
-  function tickAnimation() {
-    if (!state.playing) return;
-    state.phase = (state.phase + 5) % 360;
-    renderModeScrub();
+  function stopAnimation() {
+    state.playing = false; previousTime = null;
+    if (animationFrame !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    if ($('mode-play')) { $('mode-play').setAttribute('aria-pressed', 'false'); $('mode-play').textContent = 'PLAY'; }
+  }
+  function tickAnimation(time) {
+    animationFrame = null;
+    if (!state.playing || document.hidden || reducedMotion) { stopAnimation(); return; }
+    var elapsed = previousTime === null ? 0 : clamp(time - previousTime, 0, 100);
+    previousTime = time;
+    state.phase = (state.phase + elapsed * 0.09) % 360;
+    $('mode-phase').value = String(Math.round(state.phase));
+    var cur = state.modes.modes[state.modeIndex];
+    $('mode-readout').textContent = 'f = ' + fixed(cur.frequencyHz, 2) + ' Hz / phase ' + Math.round(state.phase) + ' deg';
     renderCanvas();
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tickAnimation);
-    else state.playing = false;
+    if (typeof requestAnimationFrame === 'function') animationFrame = requestAnimationFrame(tickAnimation);
+    else stopAnimation();
   }
 
   /* ---------- member table ---------- */
@@ -891,7 +1012,7 @@
           id: e.id + 1, area: e.area, sigmaX: e.stress.sigmaX,
           sigmaY: e.stress.sigmaY, tauMax: e.tauMax, vonMises: e.vonMises,
           sigma1: e.sigma1, centroid: e.centroid.x, state: e.vonMises / hi,
-          critical: e.vonMises > 0.7 * hi
+          critical: e.vonMises > state.model.material.sigmaYield
         };
       });
     }
@@ -904,7 +1025,7 @@
         axialForce: m.axialForce, stress: m.stress, strain: m.strain,
         euler: s.eulerCriticalLoad, slenderness: s.slendernessRatio,
         fos: s.fosGoverning, critical: !!s.critical,
-        tension: m.axialForce > 0, state: s.fosGoverning
+        tension: m.axialForce > 1e-9, compression: m.axialForce < -1e-9, state: s.fosGoverning
       };
     });
   }
@@ -916,7 +1037,7 @@
       return rows;
     }
     if (state.filter === 'tension') return rows.filter(function (r) { return r.tension; });
-    if (state.filter === 'compression') return rows.filter(function (r) { return !r.tension; });
+    if (state.filter === 'compression') return rows.filter(function (r) { return r.compression; });
     if (state.filter === 'critical') return rows.filter(function (r) { return r.critical; });
     return rows;
   }
@@ -930,7 +1051,7 @@
       }
       if (!isFinite(x)) x = Infinity;
       if (!isFinite(y)) y = Infinity;
-      return (x - y) * dir;
+      return (x === y ? 0 : x < y ? -1 : 1) * dir;
     });
   }
 
@@ -944,6 +1065,7 @@
     cols.forEach(function (c) {
       var th = hEl('th');
       th.setAttribute('scope', 'col');
+      th.setAttribute('aria-sort', c.key === state.sortKey ? (state.sortDir === 1 ? 'ascending' : 'descending') : 'none');
       var b = hEl('button', null, c.label);
       b.setAttribute('type', 'button');
       b.setAttribute('data-sort', c.key);
@@ -994,13 +1116,13 @@
         if (k === 'state') {
           if (state.kind === 'plate') {
             var hi = state.plate.maxVonMises;
-            var color = rampColor(r.vonMises / hi);
+            var color = hi > 0 ? rampColor(r.vonMises / hi) : rampColor(0);
             var mark = hEl('span', 'state-mark');
             mark.setAttribute('style', 'background:' + color + ';');
             var wrap = hEl('span', 'state-cell');
             wrap.appendChild(mark);
             wrap.appendChild(hEl('span', 'state-text',
-              r.critical ? 'HIGH' : 'NOMINAL'));
+              r.critical ? 'YIELD LIMIT' : 'BELOW YIELD'));
             td.appendChild(wrap);
           } else {
             var mark2 = hEl('span', 'state-mark');
@@ -1009,7 +1131,7 @@
             var wrap2 = hEl('span', 'state-cell');
             wrap2.appendChild(mark2);
             wrap2.appendChild(hEl('span', 'state-text', r.critical ? 'CRITICAL' :
-              (r.tension ? 'TENSION' : 'COMPRESSION')));
+              (r.tension ? 'TENSION' : r.compression ? 'COMPRESSION' : 'ZERO FORCE')));
             td.appendChild(wrap2);
           }
         } else {
@@ -1045,6 +1167,9 @@
     if (document.body && document.body.appendChild) document.body.appendChild(a);
     if (typeof a.click === 'function') a.click();
     if (document.body && document.body.removeChild && a.parentNode) document.body.removeChild(a);
+    if (url.indexOf('blob:') === 0 && typeof URL.revokeObjectURL === 'function') {
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
   }
 
   function plateInp() {
@@ -1066,31 +1191,11 @@
     L.push('*ELASTIC');
     L.push(fixed(p.material.E, 4) + ', ' + fixed(p.material.nu, 4));
     L.push('*BOUNDARY');
-    (cfg.bc.leftNodesFixed || mesh.leftNodes).forEach(function (n) {
-      L.push((n + 1) + ', 1, 1, 0.0');
-    });
-    (cfg.bc.fixedNodes || []).forEach(function (n) {
-      L.push((n + 1) + ', 1, 2, 0.0');
-    });
+    p.fixedMask.forEach(function (fixed, i) { if (fixed) L.push((Math.floor(i / 2) + 1) + ', ' + (i % 2 + 1) + ', ' + (i % 2 + 1) + ', 0.0'); });
     L.push('*STEP');
     L.push('*STATIC');
     L.push('*CLOAD');
-    function edge(list, total) {
-      if (!list || list.length < 2 || !total) return;
-      var q = total / mesh.height;
-      for (var i = 0; i < list.length - 1; i++) {
-        var a = list[i], b = list[i + 1];
-        if (a < 0 || b < 0) continue;
-        var seg = Math.abs(mesh.nodes[b].y - mesh.nodes[a].y);
-        var half = q * seg / 2;
-        if (half) {
-          L.push((a + 1) + ', 1, ' + fixed(half, 6));
-          L.push((b + 1) + ', 1, ' + fixed(half, 6));
-        }
-      }
-    }
-    edge(mesh.rightNodes, cfg.loads.rightNodesForce);
-    edge(mesh.leftNodes, cfg.loads.leftNodesForce);
+    p.forceVector.forEach(function (force, i) { if (force) L.push((Math.floor(i / 2) + 1) + ', ' + (i % 2 + 1) + ', ' + fixed(force, 6)); });
     L.push('*NODE PRINT, NSET=NALL');
     L.push('U');
     L.push('*NODE FILE');
@@ -1145,6 +1250,9 @@
       maxVonMises: p.maxVonMises, minVonMises: p.minVonMises,
       maxDisplacement: p.maxDisplacement, maxSigmaX: p.maxSigmaX,
       equilibrium: p.equilibrium,
+      verification: p.verification,
+      diagnostics: { method: p.diagnostics.method, iterations: p.diagnostics.iterations, relativeResidual: p.diagnostics.relativeResidual },
+      forceVector: p.forceVector, fixedMask: p.fixedMask,
       nodes: p.nodes.map(function (n) {
         return { id: n.id, x: n.x, y: n.y, ux: n.ux, uy: n.uy,
           rx: n.rx, ry: n.ry, vonMises: n.vonMises };
@@ -1161,6 +1269,14 @@
 
   function doExport(kind) {
     var base = state.key;
+    if (state.kind === 'field') {
+      if (kind === 'json') download(base + '.json', JSON.stringify({ format: 'MeshLab Poisson report v2.0.0',
+        units: { length: 'm', temperature: 'C', flux: 'W/m2' }, model: state.model, mesh: state.field.mesh, values: state.field.values,
+        elements: state.field.elements, verification: state.field.verification,
+        diagnostics: { method: state.field.diagnostics.method, iterations: state.field.diagnostics.iterations, relativeResidual: state.field.diagnostics.relativeResidual } }, null, 2) + '\n', 'application/json');
+      else if (kind === 'svg') download(base + '.svg', fieldSvgExport(), 'image/svg+xml');
+      return;
+    }
     if (kind === 'inp') {
       var text = state.kind === 'plate' ? plateInp() : M.exportCalculiXInp(state.model);
       download(base + '.inp', text, 'text/plain');
@@ -1178,6 +1294,31 @@
   /* ---------- full render ---------- */
 
   function renderAll() {
+    $('determinacy-title').textContent = state.kind === 'plate' ? 'DISCRETIZATION' : 'DETERMINACY';
+    $('safety-title').textContent = 'SAFETY ENVELOPE';
+    $('modes-title').textContent = 'NATURAL FREQUENCIES';
+    $('members-title').textContent = state.kind === 'plate' ? 'ELEMENT STRESSES & YIELD SAFETY' : 'MEMBER FORCES & BUCKLING SAFETY';
+    $('preset-select').value = state.key;
+    $('view-select').value = state.view;
+    $('view-select').disabled = state.kind === 'field';
+    $('member-filter').value = state.filter;
+    $('load-range').value = String(state.load);
+    $('load-output').textContent = state.load.toFixed(1) + 'x';
+    $('scale-range').value = String(state.scale);
+    $('scale-output').textContent = state.scale + 'x';
+    $('scale-range').disabled = state.kind === 'field' || (state.view !== 'deformed' && state.view !== 'modes');
+    $('scale-label').textContent = state.view === 'modes' ? 'MODE DISPLAY AMPLITUDE' : 'DEFORMATION SCALE';
+    $('load-label').textContent = state.kind === 'field' ? 'HEATER MULTIPLIER' : 'LOAD MULTIPLIER';
+    $('reactions-label').textContent = state.kind === 'field' ? 'Heat flux' : 'Reactions';
+    $('view-select').getElementsByTagName('option')[1].textContent = state.kind === 'field' ? 'Temperature field' : 'von Mises stress';
+    Array.prototype.forEach.call($('view-select').getElementsByTagName('option'), function (option) { option.disabled = state.kind === 'plate' && (option.value === 'force' || option.value === 'modes'); });
+    $('toggle-ghost').disabled = state.kind === 'field' || (state.kind === 'plate' && state.view !== 'deformed');
+    var filterOptions = $('member-filter').getElementsByTagName('option');
+    var labels = state.kind === 'field' ? ['All triangles', 'At least 50 C', 'Below 50 C', 'Above 90% of peak'] :
+      state.kind === 'plate' ? ['All triangles', 'All stress states', 'All stress states', 'Above yield limit'] : ['All members', 'Tension only', 'Compression only', 'Critical only'];
+    Array.prototype.forEach.call(filterOptions, function (option, i) { option.textContent = labels[i]; option.disabled = state.kind === 'plate' && (i === 1 || i === 2); });
+    Array.prototype.forEach.call(document.getElementsByClassName('dl-btn'), function (b) { b.disabled = state.kind === 'field' && b.getAttribute('data-export') === 'inp'; });
+    if (state.kind === 'field') { renderFieldAll(); renderVerification(); renderModeScrub(); resetInspection(); return; }
     renderHeader();
     renderStats();
     renderEquilibrium();
@@ -1188,11 +1329,127 @@
     renderModeScrub();
     renderCanvas();
     renderTable();
+    resetInspection(); renderVerification();
   }
 
   function syncViewSelect() {
     var sel = $('view-select');
-    if (sel) sel.setAttribute('value', state.view);
+    if (sel) sel.value = state.view;
+  }
+
+  /* ---------- scalar field experiment and visible verification ---------- */
+
+  var HEAT_RAMP = ['#244970', '#287d9d', '#63c5cc', '#f0d68f', '#ed8c72'];
+  function heatColor(value) {
+    return HEAT_RAMP[clamp(Math.floor((value - state.field.min) / Math.max(state.field.max - state.field.min, 1e-12) * 5), 0, 4)];
+  }
+  function fieldProjection() {
+    var mesh = state.field.mesh, unit = Math.min(880 / mesh.width, 500 / mesh.height);
+    var ox = (1000 - mesh.width * unit) / 2, oy = (640 - mesh.height * unit) / 2;
+    return function (n) { return [ox + n.x * unit, 640 - oy - n.y * unit]; };
+  }
+  function renderFieldCanvas() {
+    var svg = $('structure-svg'); clear(svg); inspectionTargets = [];
+    svg.setAttribute('viewBox', '0 0 1000 640');
+    svg.setAttribute('aria-label', 'Temperature and heat flux on a Delaunay finite element mesh');
+    var projection = fieldProjection(), field = state.field, hitLayer = svgEl('g');
+    field.elements.forEach(function (e, i) {
+      var points = e.nodes.map(function (id) { var p = projection(field.mesh.nodes[id]); return fixed(p[0], 2) + ',' + fixed(p[1], 2); }).join(' ');
+      svg.appendChild(svgEl('polygon', { points: points, fill: heatColor(e.value), stroke: state.grid ? '#263b55' : heatColor(e.value), 'stroke-width': state.grid ? 0.7 : 0.2 }));
+      if (state.reactions && i % 12 === 0) drawArrow(svg, projection(e.centroid), [e.fluxX, e.fluxY], e.value < 60 ? '#e6f5ff' : '#182b3f', null, false, 'svg-field-flux');
+      var hit = svgEl('polygon', { points: points, 'class': 'svg-plate-hit', 'aria-label': 'Triangle ' + (e.id + 1) + ', temperature ' + fixed(e.value, 2) + ' degrees C' });
+      attachTip(hit, 'Field triangle ' + (e.id + 1), function () { return [
+        { name: 'Temperature', value: fixed(e.value, 2) + ' C' },
+        { name: 'Flux x', value: signed(e.fluxX, 2) + ' W/m2' },
+        { name: 'Flux y', value: signed(e.fluxY, 2) + ' W/m2' },
+        { name: 'Area', value: fixed(e.area, 5) + ' m2' }
+      ]; });
+      hitLayer.appendChild(hit);
+    });
+    svg.appendChild(hitLayer);
+    var title = svgEl('text', { x: 20, y: 28, 'class': 'svg-title' }); title.textContent = 'HOT EDGE 100 C / COLD EDGE 0 C / INTERIOR HEATER / ARROWS = HEAT FLUX'; svg.appendChild(title);
+  }
+  function fieldSvgExport() {
+    var project = fieldProjection(), out = ['<?xml version="1.0" encoding="UTF-8"?>', '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640"><title>MeshLab Poisson temperature field</title><rect width="1000" height="640" fill="#0e1a2a"/>'];
+    state.field.elements.forEach(function (e) {
+      var points = e.nodes.map(function (id) { var p = project(state.field.mesh.nodes[id]); return fixed(p[0], 2) + ',' + fixed(p[1], 2); }).join(' ');
+      out.push('<polygon points="' + points + '" fill="' + heatColor(e.value) + '" stroke="#263b55" stroke-width="0.5"/>');
+    });
+    out.push('<text x="20" y="28" fill="#eef4fc" font-family="monospace" font-size="14">Poisson FEM / temperature C / hot edge 100 / cold edge 0</text></svg>');
+    return out.join('\n') + '\n';
+  }
+  function fieldTable() {
+    var columns = [{ key: 'id', label: 'TRIANGLE' }, { key: 'value', label: 'TEMP (C)' }, { key: 'fluxX', label: 'FLUX X (W/m2)' }, { key: 'fluxY', label: 'FLUX Y (W/m2)' }, { key: 'area', label: 'AREA (m2)' }];
+    var head = $('member-table').getElementsByTagName('thead')[0]; clear(head);
+    var tr = hEl('tr');
+    columns.forEach(function (c) {
+      var th = hEl('th'); th.setAttribute('scope', 'col'); th.setAttribute('aria-sort', state.sortKey === c.key ? (state.sortDir > 0 ? 'ascending' : 'descending') : 'none');
+      var button = hEl('button', null, c.label); button.setAttribute('type', 'button');
+      button.addEventListener('click', function () { state.sortDir = state.sortKey === c.key ? -state.sortDir : 1; state.sortKey = c.key; fieldTable(); });
+      th.appendChild(button); tr.appendChild(th);
+    }); head.appendChild(tr);
+    var rows = state.field.elements.slice();
+    if (state.filter === 'tension') rows = rows.filter(function (e) { return e.value >= 50; });
+    if (state.filter === 'compression') rows = rows.filter(function (e) { return e.value < 50; });
+    if (state.filter === 'critical') rows = rows.filter(function (e) { return e.value > state.field.max * 0.9; });
+    rows = sortRows(rows); var body = $('member-tbody'); clear(body);
+    rows.forEach(function (row) { var tr = hEl('tr'); columns.forEach(function (c) { tr.appendChild(hEl('td', null, c.key === 'id' ? 'E' + (row.id + 1) : fixed(row[c.key], c.key === 'area' ? 5 : 3))); }); body.appendChild(tr); });
+    $('table-caption').textContent = 'Triangle temperature averages and constant heat flux. Flux is -k times the temperature gradient.';
+    $('table-foot').textContent = rows.length + ' of ' + state.field.elements.length + ' triangles / insulated top and bottom / conductivity 1 W/(m K)';
+  }
+  function renderFieldAll() {
+    var field = state.field, mesh = field.mesh, diagnostics = field.diagnostics;
+    $('model-title').textContent = state.model.name;
+    $('model-caption').textContent = 'A hot edge, a cold edge and an interior heater. Linear triangles solve -div(k grad T) = q with Jacobi PCG.';
+    $('determinacy-title').textContent = 'DISCRETIZATION'; $('safety-title').textContent = 'TEMPERATURE ENVELOPE'; $('modes-title').textContent = 'ANALYTICAL PATCH CHECK'; $('members-title').textContent = 'TEMPERATURE & HEAT FLUX';
+    var grid = $('stat-grid'); clear(grid);
+    grid.appendChild(statTile('PEAK TEMPERATURE', fixed(field.max, 2), 'C', '100 C hot edge, 0 C cold edge', true));
+    grid.appendChild(statTile('DELAUNAY TRIANGLES', String(field.elements.length), '', mesh.nodes.length + ' nodes'));
+    grid.appendChild(statTile('PCG ITERATIONS', String(diagnostics.iterations), '', diagnostics.nonzeros + ' stored coefficients'));
+    grid.appendChild(statTile('RELATIVE RESIDUAL', diagnostics.relativeResidual.toExponential(2), '', 'actual residual, checked at convergence'));
+    grid.appendChild(statTile('MIN TRIANGLE ANGLE', fixed(mesh.quality.minimumAngle, 1), 'deg', 'geometry quality'));
+    grid.appendChild(statTile('HEATER INPUT', fixed(field.verification.sourceTotal, 2), 'W/m', 'heat input per unit depth'));
+    var equilibrium = $('equilibrium-table').getElementsByTagName('tbody')[0]; clear(equilibrium);
+    appendRow(equilibrium, 'Integrated source', fixed(field.verification.sourceTotal, 6) + ' W/m');
+    appendRow(equilibrium, 'Boundary flux', fixed(field.verification.boundaryFlux, 6) + ' W/m');
+    appendRow(equilibrium, 'Balance residual', field.verification.balanceResidual.toExponential(2) + ' W/m');
+    appendRow(equilibrium, 'Free node residual', field.verification.freeResidual.toExponential(2) + ' W/m');
+    $('equilibrium-badge').textContent = diagnostics.converged ? 'BALANCED' : 'CHECK'; $('equilibrium-badge').setAttribute('data-state', diagnostics.converged ? 'good' : 'critical');
+    var meshTable = $('determinacy-table').getElementsByTagName('tbody')[0]; clear(meshTable);
+    appendRow(meshTable, 'Nodes / triangles', mesh.nodes.length + ' / ' + mesh.elements.length); appendRow(meshTable, 'Free scalar DOFs', String(field.freeDofs.length));
+    appendRow(meshTable, 'Total mesh area', fixed(mesh.quality.area, 6) + ' m2'); appendRow(meshTable, 'Minimum angle', fixed(mesh.quality.minimumAngle, 2) + ' deg'); appendRow(meshTable, 'Boundary', 'Left/right prescribed');
+    clear($('safety-meter')); $('safety-meter').appendChild(hEl('p', 'panel-sub', 'Minimum ' + fixed(field.min, 2) + ' C. Maximum ' + fixed(field.max, 2) + ' C. The top and bottom edges are insulated. Heater multiplier ' + state.load.toFixed(1) + 'x.'));
+    $('safety-badge').textContent = 'THERMAL'; $('safety-badge').removeAttribute('data-state');
+    var check = M.solvePoisson(mesh, { conductivity: 1, boundary: function (n) { if (n.x === 0) return 100; if (Math.abs(n.x - mesh.width) < 1e-12) return 0; } });
+    var error = 0; mesh.nodes.forEach(function (n, i) { error = Math.max(error, Math.abs(check.values[i] - 100 * (1 - n.x / mesh.width))); });
+    clear($('mode-bars')); $('mode-bars').appendChild(hEl('p', 'panel-sub', 'With the heater off, T = 100(1 - x / width) is the exact solution. Maximum nodal error on this irregular mesh: ' + error.toExponential(2) + ' C.'));
+    var legend = $('legend-row'); clear(legend); HEAT_RAMP.forEach(function (color, i) { legend.appendChild(legendSwatch(color, fixed(field.min + (field.max - field.min) * i / 4, 0) + ' C')); });
+    legend.appendChild(hEl('span', 'legend-label', 'ARROWS = HEAT FLUX'));
+    fieldTable(); renderFieldCanvas();
+  }
+  function renderVerification() {
+    var v = state.kind === 'field' ? state.field.verification : (state.kind === 'plate' ? state.plate.verification : state.solution.verification);
+    var relative = state.kind === 'field' ? state.field.diagnostics.relativeResidual : v.relativeResidual;
+    var passed = state.kind === 'field' ? state.field.diagnostics.converged : v.passed;
+    $('verification-summary').textContent = (passed ? 'VERIFIED' : 'CHECK') + ' / residual ' + relative.toExponential(2);
+    $('verification-summary').setAttribute('data-state', passed ? 'good' : 'critical');
+    $('status-message').textContent = state.kind === 'field' ? 'PCG converged. Source and boundary heat flux balance. Run the round-trip check to reproduce the result.' :
+      'Free DOF residual ' + v.relativeResidual.toExponential(2) + '. Energy identity error ' + v.energyError.toExponential(2) + '. Run the round-trip check to reproduce the result.';
+  }
+  function runRoundTrip() {
+    try {
+      var duplicate = JSON.parse(JSON.stringify(state.model)), expected, actual;
+      if (state.kind === 'field') { expected = state.field.values; actual = solveField(duplicate.field.mesh, duplicate.field).values; }
+      else if (state.kind === 'plate') {
+        expected = state.plate.displacements;
+        actual = M.solvePlateCST(duplicate.plate.mesh, duplicate.plate.material, duplicate.plate.bc, duplicate.plate.loads).displacements;
+      } else { expected = state.solution.displacements; actual = M.solveTruss(duplicate).displacements; }
+      var error = 0, peak = 0;
+      expected.forEach(function (value, i) { error = Math.max(error, Math.abs(value - actual[i])); peak = Math.max(peak, Math.abs(value)); });
+      var relative = error / Math.max(peak, 1e-20), passed = relative < 1e-8;
+      $('status-message').textContent = (passed ? 'PASS' : 'CHECK') + ' / serialized model round-trip / relative error ' + relative.toExponential(3) +
+        (state.kind === 'plate' ? ' / independent Gaussian solver comparison' : ' / reproduced numerical solution');
+    } catch (error) { $('status-message').textContent = 'CHECK / ' + error.message; }
   }
 
   /* ---------- wiring ---------- */
@@ -1205,24 +1462,42 @@
       o.setAttribute('value', p.key);
       presetSel.appendChild(o);
     });
-    presetSel.setAttribute('value', state.key);
+    presetSel.value = state.key;
 
     presetSel.addEventListener('change', function (e) {
-      compute((e.target && e.target.value) || state.key);
-      renderAll();
+      state.filter = 'all';
+      updateAnalysis((e.target && e.target.value) || state.key);
     });
     $('view-select').addEventListener('change', function (e) {
       state.view = (e.target && e.target.value) || 'force';
-      if (state.view === 'modes' && state.kind === 'plate') {
+      stopAnimation();
+      if ((state.view === 'modes' || state.view === 'force') && state.kind === 'plate') {
         state.view = 'stress'; syncViewSelect();
       }
       renderAll();
     });
     $('scale-range').addEventListener('input', function (e) {
-      state.scale = Number((e.target && e.target.value) || 100);
+      var scale = Number((e.target && e.target.value) || 100);
+      if (!isFinite(scale)) return;
+      state.scale = clamp(scale, 1, 500);
       $('scale-output').textContent = state.scale + 'x';
       renderStats();
       renderCanvas();
+    });
+    $('load-range').addEventListener('input', function (e) {
+      var load = Number(e.target.value);
+      if (!isFinite(load)) return;
+      state.load = clamp(load, 0, 5); updateAnalysis(state.key);
+    });
+    $('run-checks').addEventListener('click', runRoundTrip);
+    Array.prototype.forEach.call(document.getElementsByClassName('scenario-btn'), function (button) {
+      button.addEventListener('click', function () {
+        var scenarios = { bridge: ['pratt', 'force', 1, 100], crane: ['crane', 'deformed', 5, 50], plate: ['plate', 'stress', 1, 100], heat: ['heat', 'stress', 1, 100] };
+        var scenario = scenarios[button.getAttribute('data-scenario')];
+        state.view = scenario[1]; state.load = scenario[2]; state.scale = scenario[3]; state.filter = 'all';
+        updateAnalysis(scenario[0]);
+        Array.prototype.forEach.call(document.getElementsByClassName('scenario-btn'), function (b) { b.setAttribute('aria-pressed', b === button ? 'true' : 'false'); });
+      });
     });
     $('toggle-ghost').addEventListener('change', function (e) {
       state.ghost = !!(e.target && e.target.checked); renderLegend(); renderCanvas();
@@ -1234,22 +1509,28 @@
       state.grid = !!(e.target && e.target.checked); renderCanvas();
     });
     $('member-filter').addEventListener('change', function (e) {
-      state.filter = (e.target && e.target.value) || 'all'; renderTable();
+      state.filter = (e.target && e.target.value) || 'all'; if (state.kind === 'field') fieldTable(); else renderTable();
     });
     $('mode-select').addEventListener('change', function (e) {
-      state.modeIndex = Number((e.target && e.target.value) || 0);
+      var index = Number((e.target && e.target.value) || 0);
+      if (!isFinite(index) || !state.modes || !state.modes.modes.length) return;
+      state.modeIndex = clamp(Math.floor(index), 0, state.modes.modes.length - 1);
       renderModeScrub(); renderModeBars(); renderCanvas();
     });
     $('mode-phase').addEventListener('input', function (e) {
-      state.phase = Number((e.target && e.target.value) || 0);
+      var phase = Number((e.target && e.target.value) || 0);
+      if (!isFinite(phase)) return;
+      state.phase = clamp(phase, 0, 360);
       renderModeScrub(); renderCanvas();
     });
     $('mode-play').addEventListener('click', function () {
-      state.playing = !state.playing;
+      if (reducedMotion) { $('status-message').textContent = 'Reduced motion is enabled. Use the phase slider to inspect each mode.'; return; }
+      if (state.playing) { stopAnimation(); return; }
+      state.playing = true; previousTime = null;
       var b = $('mode-play');
       b.setAttribute('aria-pressed', state.playing ? 'true' : 'false');
       b.textContent = state.playing ? 'PAUSE' : 'PLAY';
-      if (state.playing) tickAnimation();
+      if (typeof requestAnimationFrame === 'function' && animationFrame === null) animationFrame = requestAnimationFrame(tickAnimation);
     });
     $('theme-toggle').addEventListener('click', function () {
       state.theme = state.theme === 'dark' ? 'light' : 'dark';
@@ -1260,7 +1541,8 @@
       $('theme-label').textContent = state.theme === 'dark' ? 'LIGHT MODE' : 'DARK MODE';
       b.setAttribute('title', state.theme === 'dark' ?
         'Switch to light blueprint mode' : 'Switch to dark slate mode');
-      renderLegend(); renderCanvas(); renderTable(); renderModeBars();
+      if (state.kind === 'field') renderFieldAll();
+      else { renderLegend(); renderCanvas(); renderTable(); renderModeBars(); }
     });
     var dlButtons = document.getElementsByClassName
       ? document.getElementsByClassName('dl-btn') : [];
@@ -1270,8 +1552,8 @@
       });
     });
 
-    compute(state.key);
-    renderAll();
+    document.addEventListener('visibilitychange', function () { if (document.hidden) stopAnimation(); });
+    updateAnalysis(state.key);
   }
 
   init();
