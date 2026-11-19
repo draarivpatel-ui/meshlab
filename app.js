@@ -547,10 +547,6 @@
 
   /* ---------- plate canvas ---------- */
 
-  function plateRowsData() {
-    return state.plate.elements;
-  }
-
   function renderPlateCanvas(svg, pr) {
     var p = state.plate;
     var mesh = p.mesh;
