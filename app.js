@@ -27,7 +27,7 @@
     light: { tension: '#2a78d6', compression: '#e34948', accent: '#2a78d6',
       load: '#1baf7a', reaction: '#eb6834', neutral: '#7b8a9c' }
   };
-  var STATUS = { good: 'var(--good)', warning: 'var(--warning)', serious: 'var(--serious)', critical: 'var(--critical)' };
+  var STATUS = { good: 'var(--good)', warning: 'var(--warning)', critical: 'var(--critical)' };
 
   var state = {
     key: 'pratt', kind: 'truss', model: null, solution: null,

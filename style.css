@@ -37,7 +37,6 @@ html[data-theme="dark"] {
   --cat-3: #199e70;
   --good: #77dfb8;
   --warning: #ffd078;
-  --serious: #ec835a;
   --critical: #ff9d9d;
   --ghost: #47617f;
   --shadow: 0 12px 34px rgba(0, 0, 0, 0.42);
@@ -68,7 +67,6 @@ html[data-theme="light"] {
   --cat-3: #1baf7a;
   --good: #146b45;
   --warning: #825700;
-  --serious: #ec835a;
   --critical: #a92c35;
   --ghost: #9aa6b4;
   --shadow: 0 12px 30px rgba(24, 40, 64, 0.10);
