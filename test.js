@@ -759,9 +759,9 @@ test('CST mesh refinement does not change the exact uniform stress', () => {
 /* Presets                                                                    */
 /* ------------------------------------------------------------------------- */
 
-test('seven built in presets are listed with the required names', () => {
+test('ten built in presets are listed with the required names', () => {
   const names = M.getPresets().map((p) => p.name);
-  assert.equal(names.length, 7);
+  assert.equal(names.length, 10);
   assert.deepEqual(names, [
     'Pratt Bridge Truss (7-Bay)',
     'Warren Roof Truss',
@@ -769,7 +769,10 @@ test('seven built in presets are listed with the required names', () => {
     'Transmission Tower Lattice',
     '3D Space Tripod Dome',
     'Perforated Plate in Tension (Kirsch Stress Concentration)',
-    'Heat Flow on a Delaunay Mesh'
+    'Heat Flow on a Delaunay Mesh',
+    'L-Bracket Conduction',
+    'Annulus Conduction',
+    'Heat Sink Fin Conduction'
   ]);
 });
 

@@ -21,7 +21,7 @@
     </svg>
     <div class="brand-text">
       <span class="brand-name">MESH<span class="brand-accent">LAB</span></span>
-      <span class="brand-sub">ENGINEERING WORKBENCH <span class="brand-ver">v2.0.0</span></span>
+      <span class="brand-sub"><span class="brand-ver">v2.0.0</span></span>
     </div>
   </div>
   <div class="header-meta">
@@ -34,12 +34,12 @@
 </header>
 
 <section class="showcase" aria-labelledby="showcase-title">
-  <div class="showcase-intro"><span class="eyebrow">A LAB YOU CAN INSPECT</span><h2 id="showcase-title">See the physics. Check the math.</h2><p>One click, a real numerical experiment. Change the load, inspect the result, and challenge the solver.</p></div>
+  <div class="showcase-intro"><h2 id="showcase-title">See the physics. Check the math.</h2></div>
   <div class="showcase-grid" role="group" aria-label="One click showcase experiments">
-    <button type="button" class="scenario-btn" data-scenario="bridge"><span class="scenario-index">01 / LOAD PATH</span><strong>Trace a bridge</strong><span>Watch tension and compression balance.</span></button>
-    <button type="button" class="scenario-btn" data-scenario="crane"><span class="scenario-index">02 / FAILURE LIMIT</span><strong>Overload a crane</strong><span>Find the member that governs safety.</span></button>
-    <button type="button" class="scenario-btn" data-scenario="plate"><span class="scenario-index">03 / STRESS CONCENTRATION</span><strong>Stress around a hole</strong><span>A small opening redirects a large force.</span></button>
-    <button type="button" class="scenario-btn" data-scenario="heat"><span class="scenario-index">04 / FIELD PHYSICS</span><strong>Follow the heat</strong><span>Delaunay triangles, Poisson FEM, live flux.</span></button>
+    <button type="button" class="scenario-btn" data-scenario="bridge"><strong>Trace a bridge</strong></button>
+    <button type="button" class="scenario-btn" data-scenario="crane"><strong>Overload a crane</strong></button>
+    <button type="button" class="scenario-btn" data-scenario="plate"><strong>Stress around a hole</strong></button>
+    <button type="button" class="scenario-btn" data-scenario="heat"><strong>Follow the heat</strong></button>
   </div>
 </section>
 
@@ -75,7 +75,6 @@
     <div class="panel-head">
       <div>
         <h1 id="model-title">Pratt Bridge Truss (7-Bay)</h1>
-        <p class="panel-sub" id="model-caption">2D pin jointed truss. Direct stiffness solution, SI units.</p>
       </div>
       <div class="panel-actions">
         <span class="live-chip" id="solve-status"><span class="live-dot"></span> SOLVED</span>
@@ -83,6 +82,7 @@
           <button type="button" class="dl-btn" data-export="inp" title="Download CalculiX / Abaqus input deck">.INP</button>
           <button type="button" class="dl-btn" data-export="svg" title="Download the deformed shape as SVG">.SVG</button>
           <button type="button" class="dl-btn" data-export="json" title="Download the full analysis report as JSON">.JSON</button>
+          <button type="button" class="dl-btn" data-export="vtk" title="Download the mesh and field data as a VTK unstructured grid">.VTK</button>
         </div>
       </div>
     </div>
@@ -148,7 +148,6 @@
   <div class="table-head">
     <div>
       <h2 id="members-title">MEMBER FORCES &amp; BUCKLING SAFETY</h2>
-      <p class="panel-sub" id="table-caption">Per member axial force, stress and governing factor of safety. Sortable.</p>
     </div>
     <label class="table-filter">
       <span class="field-label">SHOW</span>

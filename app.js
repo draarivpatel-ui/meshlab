@@ -34,8 +34,10 @@
     safety: null, modes: null, plate: null, field: null, load: 1,
     view: 'force', scale: 100, ghost: true, reactions: true, grid: true,
     theme: 'dark', modeIndex: 0, phase: 0, playing: false,
-    filter: 'all', sortKey: 'id', sortDir: 1, hovered: -1, pinned: -1
+    filter: 'all', sortKey: 'id', sortDir: 1, hovered: -1, pinned: -1,
+    resolution: 1
   };
+  var patchCheckCache = {};
   var inspectionTargets = [], animationFrame = null, previousTime = null;
   var reducedMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -103,8 +105,17 @@
       if (state.view === 'modes' || state.view === 'force') { state.view = 'stress'; syncViewSelect(); }
       clear($('mode-select'));
     } else if (state.kind === 'field') {
-      model.field.heater *= state.load;
-      state.field = solveField(model.field.mesh, model.field);
+      var fc = model.field;
+      if (fc.spec && state.resolution !== 1) {
+        fc.mesh = M.generateDomainMesh(Object.assign({}, fc.spec, {
+          nx: Math.min(60, Math.max(2, Math.round(fc.spec.nx * state.resolution))),
+          ny: Math.min(60, Math.max(2, Math.round(fc.spec.ny * state.resolution))) }));
+      }
+      if (fc.heater !== undefined) fc.heater *= state.load;
+      else if (fc.hotEdge !== undefined) {
+        fc.hotEdge = (fc.coldEdge || 0) + (fc.hotEdge - (fc.coldEdge || 0)) * state.load;
+      }
+      state.field = solveField(fc.mesh, fc);
       state.view = 'stress'; syncViewSelect();
     } else {
       var sol = M.solveTruss(model);
@@ -121,9 +132,19 @@
   }
 
   function solveField(mesh, config) {
+    var hotSet = new Set((mesh.bcSets && mesh.bcSets.hot) || []);
+    var coldSet = new Set((mesh.bcSets && mesh.bcSets.cold) || []);
     return M.solvePoisson(mesh, { conductivity: config.conductivity,
-      source: function (x, y) { return config.heater * Math.exp(-Math.pow((x - mesh.width * config.heaterX) / config.heaterRadius, 2) - Math.pow((y - mesh.height * config.heaterY) / config.heaterRadius, 2)); },
-      boundary: function (node) { if (node.x === 0) return config.hotEdge; if (Math.abs(node.x - mesh.width) < 1e-12) return config.coldEdge; }
+      source: config.heater === undefined ? undefined : function (x, y) {
+        return config.heater * Math.exp(-Math.pow((x - mesh.width * config.heaterX) / config.heaterRadius, 2) -
+          Math.pow((y - mesh.height * config.heaterY) / config.heaterRadius, 2));
+      },
+      boundary: function (node, i) {
+        if (hotSet.has(i)) return config.hotEdge;
+        if (coldSet.has(i)) return config.coldEdge;
+        if (node.x === 0) return config.hotEdge;
+        if (Math.abs(node.x - mesh.width) < 1e-12) return config.coldEdge;
+      }
     });
   }
 
@@ -386,10 +407,10 @@
     g.appendChild(grid);
   }
 
-  function drawArrow(g, at, vec, color, label, into, textClass) {
+  function drawArrow(g, at, vec, color, label, into, textClass, lenPx) {
     var mag = Math.sqrt(vec[0] * vec[0] + vec[1] * vec[1]);
     if (!(mag > 1e-12)) return;
-    var len = 34;
+    var len = lenPx === undefined ? 34 : lenPx;
     var ux = vec[0] / mag, uy = -vec[1] / mag;
     var tail = into ? [at[0] - ux * len, at[1] - uy * len] : [at[0], at[1]];
     var tip = into ? [at[0], at[1]] : [at[0] + ux * len, at[1] + uy * len];
@@ -672,15 +693,6 @@
   function renderHeader() {
     var p = M.getPresets().filter(function (x) { return x.key === state.key; })[0];
     $('model-title').textContent = p.name;
-    var caption;
-    if (state.kind === 'plate') {
-      caption = 'Finite width plane stress plate with a stair step hole boundary. CST stress tensors, SI units.';
-    } else if (state.model.dim === 3) {
-      caption = '3D pin jointed truss with isometric projection. Direct stiffness solution, SI units.';
-    } else {
-      caption = '2D pin jointed truss. Direct stiffness solution, SI units.';
-    }
-    $('model-caption').textContent = caption;
   }
 
   function statTile(label, value, unit, note, hero) {
@@ -1144,9 +1156,6 @@
       });
       tbody.appendChild(tr);
     });
-    $('table-caption').textContent = state.kind === 'plate'
-      ? 'Per triangle CST stress state. Sequential ramp shows von Mises magnitude. Sortable.'
-      : 'Per member axial force, stress and governing factor of safety. Sortable.';
     $('table-foot').textContent = rows.length + ' of ' + tableRows().length +
       ' rows shown / click any column header to sort / all values are also in the .JSON report';
   }
@@ -1267,8 +1276,37 @@
     return JSON.stringify(report, null, 2) + '\n';
   }
 
+  function vtkData() {
+    if (state.kind === 'field') {
+      return { mesh: state.field.mesh, data: { title: 'MeshLab ' + state.model.name,
+        pointScalars: [{ name: 'temperature', values: state.field.values }],
+        pointVectors: [{ name: 'nodal_flux', values: state.field.nodeFlux }],
+        cellVectors: [{ name: 'heat_flux', values: state.field.elements.map(function (e) { return [e.fluxX, e.fluxY, 0]; }) }] } };
+    }
+    if (state.kind === 'plate') {
+      var p = state.plate;
+      return { mesh: { nodes: p.mesh.nodes, elements: p.mesh.elements }, data: { title: 'MeshLab ' + state.model.name,
+        pointScalars: [{ name: 'vonMises', values: p.nodes.map(function (n) { return n.vonMises; }) }],
+        pointVectors: [{ name: 'displacement', values: p.nodes.map(function (n) { return [n.ux, n.uy, 0]; }) }],
+        cellScalars: [{ name: 'vonMises_element', values: p.elements.map(function (e) { return e.vonMises; }) }] } };
+    }
+    var d = state.model.dim;
+    return { mesh: { nodes: state.model.nodes, elements: state.solution.members.map(function (m) { return { nodes: [m.a, m.b] }; }) },
+      data: { title: 'MeshLab ' + state.model.name,
+        pointVectors: [{ name: 'displacement', values: state.solution.nodes.map(function (n) {
+          return d === 3 ? n.displacement : n.displacement.concat([0]);
+        }) }],
+        cellScalars: [{ name: 'axial_force', values: state.solution.members.map(function (m) { return m.axialForce; }) },
+          { name: 'axial_stress', values: state.solution.members.map(function (m) { return m.stress; }) }] } };
+  }
+
   function doExport(kind) {
     var base = state.key;
+    if (kind === 'vtk') {
+      var v = vtkData();
+      download(base + '.vtk', M.exportVtk(v.mesh, v.data), 'text/plain');
+      return;
+    }
     if (state.kind === 'field') {
       if (kind === 'json') download(base + '.json', JSON.stringify({ format: 'MeshLab Poisson report v2.0.0',
         units: { length: 'm', temperature: 'C', flux: 'W/m2' }, model: state.model, mesh: state.field.mesh, values: state.field.values,
@@ -1304,10 +1342,22 @@
     $('member-filter').value = state.filter;
     $('load-range').value = String(state.load);
     $('load-output').textContent = state.load.toFixed(1) + 'x';
-    $('scale-range').value = String(state.scale);
-    $('scale-output').textContent = state.scale + 'x';
-    $('scale-range').disabled = state.kind === 'field' || (state.view !== 'deformed' && state.view !== 'modes');
-    $('scale-label').textContent = state.view === 'modes' ? 'MODE DISPLAY AMPLITUDE' : 'DEFORMATION SCALE';
+    var scaleR = $('scale-range');
+    if (state.kind === 'field') {
+      scaleR.setAttribute('min', '0.5'); scaleR.setAttribute('max', '3'); scaleR.setAttribute('step', '0.25');
+      scaleR.value = String(state.resolution);
+      scaleR.setAttribute('aria-label', 'Mesh resolution multiplier from 0.5x to 3x');
+      $('scale-output').textContent = state.resolution + 'x';
+      $('scale-label').textContent = 'MESH RESOLUTION';
+      scaleR.disabled = false;
+    } else {
+      scaleR.setAttribute('min', '1'); scaleR.setAttribute('max', '500'); scaleR.setAttribute('step', '1');
+      scaleR.value = String(state.scale);
+      scaleR.setAttribute('aria-label', 'Deformation exaggeration from 1x to 500x');
+      $('scale-output').textContent = state.scale + 'x';
+      $('scale-label').textContent = state.view === 'modes' ? 'MODE DISPLAY AMPLITUDE' : 'DEFORMATION SCALE';
+      scaleR.disabled = state.view !== 'deformed' && state.view !== 'modes';
+    }
     $('load-label').textContent = state.kind === 'field' ? 'HEATER MULTIPLIER' : 'LOAD MULTIPLIER';
     $('reactions-label').textContent = state.kind === 'field' ? 'Heat flux' : 'Reactions';
     $('view-select').getElementsByTagName('option')[1].textContent = state.kind === 'field' ? 'Temperature field' : 'von Mises stress';
@@ -1339,24 +1389,80 @@
 
   /* ---------- scalar field experiment and visible verification ---------- */
 
-  var HEAT_RAMP = ['#244970', '#287d9d', '#63c5cc', '#f0d68f', '#ed8c72'];
+  var HEAT_STOPS = ['#244970', '#287d9d', '#63c5cc', '#f0d68f', '#ed8c72'];
+  var HEAT_RGB = null;
+  function heatStops() {
+    if (!HEAT_RGB) HEAT_RGB = HEAT_STOPS.map(function (h) {
+      return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+    });
+    return HEAT_RGB;
+  }
   function heatColor(value) {
-    return HEAT_RAMP[clamp(Math.floor((value - state.field.min) / Math.max(state.field.max - state.field.min, 1e-12) * 5), 0, 4)];
+    var t = clamp((value - state.field.min) / Math.max(state.field.max - state.field.min, 1e-12), 0, 1);
+    var stops = heatStops(), x = t * (stops.length - 1), i0 = Math.floor(x), f = x - i0;
+    var a = stops[i0], b = stops[Math.min(i0 + 1, stops.length - 1)];
+    return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * f) + ',' +
+      Math.round(a[1] + (b[1] - a[1]) * f) + ',' + Math.round(a[2] + (b[2] - a[2]) * f) + ')';
   }
+
+  var DOMAIN_INFO = {
+    rect: { title: 'HOT LEFT EDGE / COLD RIGHT EDGE / INTERIOR HEATER / ARROW LENGTH = |q|',
+      boundary: 'Left/right prescribed', patch: 'rect' },
+    l: { title: 'HOT LEFT EDGE / COLD RIGHT EDGE / INTERIOR HEATER / ARROW LENGTH = |q|',
+      boundary: 'Left/right prescribed', patch: 'none' },
+    annulus: { title: 'HOT INNER RING / COLD OUTER RING / PURE CONDUCTION',
+      boundary: 'Inner/outer ring prescribed', patch: 'annulus' },
+    sink: { title: 'HOT BASE / COLD FIN SURFACES / INTERIOR HEATER / ARROW LENGTH = |q|',
+      boundary: 'Base + fin walls prescribed', patch: 'none' }
+  };
+  function fieldDomain() {
+    return (state.field.mesh.domainSpec && DOMAIN_INFO[state.field.mesh.domainSpec.type]) || DOMAIN_INFO.rect;
+  }
+
   function fieldProjection() {
-    var mesh = state.field.mesh, unit = Math.min(880 / mesh.width, 500 / mesh.height);
-    var ox = (1000 - mesh.width * unit) / 2, oy = (640 - mesh.height * unit) / 2;
-    return function (n) { return [ox + n.x * unit, 640 - oy - n.y * unit]; };
+    var mesh = state.field.mesh;
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    mesh.nodes.forEach(function (n) {
+      minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+      minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+    });
+    var w = Math.max(maxX - minX, 1e-9), h = Math.max(maxY - minY, 1e-9);
+    var unit = Math.min(880 / w, 500 / h);
+    var ox = (1000 - w * unit) / 2, oy = (640 - h * unit) / 2;
+    return function (n) { return [ox + (n.x - minX) * unit, 640 - oy - (n.y - minY) * unit]; };
   }
+
+  function fieldNodeRows(node, i) {
+    var fl = state.field.nodeFlux[i] || { x: 0, y: 0 };
+    var q = Math.hypot(fl.x, fl.y);
+    return [
+      { name: 'x', value: fixed(node.x, 4) + ' m' },
+      { name: 'y', value: fixed(node.y, 4) + ' m' },
+      { name: 'Temperature', value: fixed(state.field.values[i], 3) + ' C', color: heatColor(state.field.values[i]) },
+      { name: '|grad T|', value: fixed(q / Math.max(state.field.conductivity, 1e-12), 3) + ' K/m' },
+      { name: '|flux q|', value: fixed(q, 3) + ' W/m2' }
+    ];
+  }
+
   function renderFieldCanvas() {
     var svg = $('structure-svg'); clear(svg); inspectionTargets = [];
     svg.setAttribute('viewBox', '0 0 1000 640');
     svg.setAttribute('aria-label', 'Temperature and heat flux on a Delaunay finite element mesh');
-    var projection = fieldProjection(), field = state.field, hitLayer = svgEl('g');
+    var projection = fieldProjection(), field = state.field, mesh = field.mesh;
+    var hitLayer = svgEl('g');
+    var maxMag = 0;
+    field.elements.forEach(function (e) { maxMag = Math.max(maxMag, Math.hypot(e.fluxX, e.fluxY)); });
+    var stride = Math.max(1, Math.round(field.elements.length / 26));
+    var midT = (field.min + field.max) / 2;
     field.elements.forEach(function (e, i) {
-      var points = e.nodes.map(function (id) { var p = projection(field.mesh.nodes[id]); return fixed(p[0], 2) + ',' + fixed(p[1], 2); }).join(' ');
-      svg.appendChild(svgEl('polygon', { points: points, fill: heatColor(e.value), stroke: state.grid ? '#263b55' : heatColor(e.value), 'stroke-width': state.grid ? 0.7 : 0.2 }));
-      if (state.reactions && i % 12 === 0) drawArrow(svg, projection(e.centroid), [e.fluxX, e.fluxY], e.value < 60 ? '#e6f5ff' : '#182b3f', null, false, 'svg-field-flux');
+      var points = e.nodes.map(function (id) { var p = projection(mesh.nodes[id]); return fixed(p[0], 2) + ',' + fixed(p[1], 2); }).join(' ');
+      var fill = heatColor(e.value);
+      svg.appendChild(svgEl('polygon', { points: points, fill: fill, stroke: state.grid ? '#263b55' : fill, 'stroke-width': state.grid ? 0.7 : 0.2 }));
+      if (state.reactions && i % stride === 0) {
+        var m2 = Math.hypot(e.fluxX, e.fluxY);
+        if (m2 > maxMag * 0.02) drawArrow(svg, projection(e.centroid), [e.fluxX, e.fluxY],
+          e.value < midT ? '#e6f5ff' : '#182b3f', null, false, 'svg-field-flux', 10 + 26 * Math.pow(m2 / maxMag, 0.6));
+      }
       var hit = svgEl('polygon', { points: points, 'class': 'svg-plate-hit', 'aria-label': 'Triangle ' + (e.id + 1) + ', temperature ' + fixed(e.value, 2) + ' degrees C' });
       attachTip(hit, 'Field triangle ' + (e.id + 1), function () { return [
         { name: 'Temperature', value: fixed(e.value, 2) + ' C' },
@@ -1367,7 +1473,30 @@
       hitLayer.appendChild(hit);
     });
     svg.appendChild(hitLayer);
-    var title = svgEl('text', { x: 20, y: 28, 'class': 'svg-title' }); title.textContent = 'HOT EDGE 100 C / COLD EDGE 0 C / INTERIOR HEATER / ARROWS = HEAT FLUX'; svg.appendChild(title);
+    if (mesh.nodes.length <= 800) {
+      var nodeG = svgEl('g');
+      mesh.nodes.forEach(function (n, i) {
+        var p = projection(n);
+        var dot = svgEl('circle', { cx: fixed(p[0], 2), cy: fixed(p[1], 2), r: 2.4, 'class': 'svg-field-node' });
+        (function (node, idx, dotEl) {
+          dotEl.addEventListener('pointerenter', function (evt) {
+            var rows = fieldNodeRows(node, idx);
+            showTooltip('Node ' + (idx + 1), rows, evt);
+            if (state.pinned < 0) renderInspection('FIELD NODE ' + (idx + 1), rows);
+          });
+          dotEl.addEventListener('pointerleave', hideTooltip);
+          dotEl.addEventListener('click', function () {
+            var rows = fieldNodeRows(node, idx);
+            renderInspection('FIELD NODE ' + (idx + 1), rows);
+          });
+        })(n, i, dot);
+        nodeG.appendChild(dot);
+      });
+      svg.appendChild(nodeG);
+    }
+    var title = svgEl('text', { x: 20, y: 28, 'class': 'svg-title' });
+    title.textContent = fieldDomain().title;
+    svg.appendChild(title);
   }
   function fieldSvgExport() {
     var project = fieldProjection(), out = ['<?xml version="1.0" encoding="UTF-8"?>', '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640"><title>MeshLab Poisson temperature field</title><rect width="1000" height="640" fill="#0e1a2a"/>'];
@@ -1394,21 +1523,35 @@
     if (state.filter === 'critical') rows = rows.filter(function (e) { return e.value > state.field.max * 0.9; });
     rows = sortRows(rows); var body = $('member-tbody'); clear(body);
     rows.forEach(function (row) { var tr = hEl('tr'); columns.forEach(function (c) { tr.appendChild(hEl('td', null, c.key === 'id' ? 'E' + (row.id + 1) : fixed(row[c.key], c.key === 'area' ? 5 : 3))); }); body.appendChild(tr); });
-    $('table-caption').textContent = 'Triangle temperature averages and constant heat flux. Flux is -k times the temperature gradient.';
-    $('table-foot').textContent = rows.length + ' of ' + state.field.elements.length + ' triangles / insulated top and bottom / conductivity 1 W/(m K)';
+    $('table-foot').textContent = rows.length + ' of ' + state.field.elements.length + ' triangles / ' + fieldDomain().boundary + ' / conductivity ' + fixed(state.field.conductivity, 2) + ' W/(m K)';
   }
+  function elementMinAngle(mesh, e) {
+    var p = e.nodes.map(function (id) { return mesh.nodes[id]; }), worst = 180;
+    for (var i = 0; i < 3; i++) {
+      var o = p[i], u = p[(i + 1) % 3], v = p[(i + 2) % 3];
+      var ax = u.x - o.x, ay = u.y - o.y, bx = v.x - o.x, by = v.y - o.y;
+      var cs = (ax * bx + ay * by) / Math.max(Math.sqrt((ax * ax + ay * ay) * (bx * bx + by * by)), 1e-30);
+      worst = Math.min(worst, Math.acos(clamp(cs, -1, 1)) * 180 / Math.PI);
+    }
+    return worst;
+  }
+
   function renderFieldAll() {
     var field = state.field, mesh = field.mesh, diagnostics = field.diagnostics;
+    var dom = fieldDomain(), cfg = state.model.field;
     $('model-title').textContent = state.model.name;
-    $('model-caption').textContent = 'A hot edge, a cold edge and an interior heater. Linear triangles solve -div(k grad T) = q with Jacobi PCG.';
-    $('determinacy-title').textContent = 'DISCRETIZATION'; $('safety-title').textContent = 'TEMPERATURE ENVELOPE'; $('modes-title').textContent = 'ANALYTICAL PATCH CHECK'; $('members-title').textContent = 'TEMPERATURE & HEAT FLUX';
+    $('determinacy-title').textContent = 'DISCRETIZATION'; $('safety-title').textContent = 'MESH QUALITY'; $('modes-title').textContent = 'PCG CONVERGENCE'; $('members-title').textContent = 'TEMPERATURE & HEAT FLUX';
     var grid = $('stat-grid'); clear(grid);
-    grid.appendChild(statTile('PEAK TEMPERATURE', fixed(field.max, 2), 'C', '100 C hot edge, 0 C cold edge', true));
+    grid.appendChild(statTile('PEAK TEMPERATURE', fixed(field.max, 2), 'C', fixed(cfg.hotEdge, 0) + ' C hot / ' + fixed(cfg.coldEdge, 0) + ' C cold', true));
     grid.appendChild(statTile('DELAUNAY TRIANGLES', String(field.elements.length), '', mesh.nodes.length + ' nodes'));
     grid.appendChild(statTile('PCG ITERATIONS', String(diagnostics.iterations), '', diagnostics.nonzeros + ' stored coefficients'));
     grid.appendChild(statTile('RELATIVE RESIDUAL', diagnostics.relativeResidual.toExponential(2), '', 'actual residual, checked at convergence'));
-    grid.appendChild(statTile('MIN TRIANGLE ANGLE', fixed(mesh.quality.minimumAngle, 1), 'deg', 'geometry quality'));
-    grid.appendChild(statTile('HEATER INPUT', fixed(field.verification.sourceTotal, 2), 'W/m', 'heat input per unit depth'));
+    grid.appendChild(statTile('MIN TRIANGLE ANGLE', fixed(mesh.quality.minimumAngle, 1), 'deg', 'max radius-edge ' + fixed(mesh.quality.maxRadiusEdge || 0, 2)));
+    if (cfg.heater !== undefined) {
+      grid.appendChild(statTile('HEATER INPUT', fixed(field.verification.sourceTotal, 2), 'W/m', 'heat input per unit depth'));
+    } else {
+      grid.appendChild(statTile('DOMAIN AREA', fixed(mesh.quality.area, 4), 'm2', 'Euler V-E+F ' + (mesh.chi === undefined ? 1 : mesh.chi)));
+    }
     var equilibrium = $('equilibrium-table').getElementsByTagName('tbody')[0]; clear(equilibrium);
     appendRow(equilibrium, 'Integrated source', fixed(field.verification.sourceTotal, 6) + ' W/m');
     appendRow(equilibrium, 'Boundary flux', fixed(field.verification.boundaryFlux, 6) + ' W/m');
@@ -1417,14 +1560,75 @@
     $('equilibrium-badge').textContent = diagnostics.converged ? 'BALANCED' : 'CHECK'; $('equilibrium-badge').setAttribute('data-state', diagnostics.converged ? 'good' : 'critical');
     var meshTable = $('determinacy-table').getElementsByTagName('tbody')[0]; clear(meshTable);
     appendRow(meshTable, 'Nodes / triangles', mesh.nodes.length + ' / ' + mesh.elements.length); appendRow(meshTable, 'Free scalar DOFs', String(field.freeDofs.length));
-    appendRow(meshTable, 'Total mesh area', fixed(mesh.quality.area, 6) + ' m2'); appendRow(meshTable, 'Minimum angle', fixed(mesh.quality.minimumAngle, 2) + ' deg'); appendRow(meshTable, 'Boundary', 'Left/right prescribed');
-    clear($('safety-meter')); $('safety-meter').appendChild(hEl('p', 'panel-sub', 'Minimum ' + fixed(field.min, 2) + ' C. Maximum ' + fixed(field.max, 2) + ' C. The top and bottom edges are insulated. Heater multiplier ' + state.load.toFixed(1) + 'x.'));
+    appendRow(meshTable, 'Total mesh area', fixed(mesh.quality.area, 6) + ' m2');
+    appendRow(meshTable, 'Euler V-E+F', String(mesh.chi === undefined ? 1 : mesh.chi) + (dom.patch === 'annulus' ? ' (one hole)' : ''));
+    appendRow(meshTable, 'Minimum angle', fixed(mesh.quality.minimumAngle, 2) + ' deg'); appendRow(meshTable, 'Boundary', dom.boundary);
+    var meter = $('safety-meter'); clear(meter);
+    meter.appendChild(hEl('p', 'panel-sub', 'Field min ' + fixed(field.min, 2) + ' C / max ' + fixed(field.max, 2) + ' C. Multiplier ' + state.load.toFixed(1) + 'x. Element minimum-angle histogram below.'));
+    var bins = [0, 0, 0, 0, 0, 0], peak = 1;
+    field.elements.forEach(function (e) { bins[Math.min(5, Math.floor(elementMinAngle(mesh, e) / 15))]++; });
+    bins.forEach(function (b) { peak = Math.max(peak, b); });
+    bins.forEach(function (count, i) {
+      var row = hEl('div', 'mode-bar-row');
+      row.appendChild(hEl('span', 'mode-bar-idx', (i * 15) + '-' + ((i + 1) * 15)));
+      var track = hEl('div', 'mode-bar-track'), fill = hEl('div', 'mode-bar-fill');
+      fill.setAttribute('style', 'width:' + fixed(count / peak * 100, 2) + '%;' + (i < 2 ? 'background:var(--warning);' : ''));
+      track.appendChild(fill); row.appendChild(track);
+      row.appendChild(hEl('span', 'mode-bar-val', String(count)));
+      meter.appendChild(row);
+    });
+    meter.appendChild(hEl('p', 'panel-sub', 'Degrees / ' + field.elements.length + ' triangles / min ' + fixed(mesh.quality.minimumAngle, 1) + ' deg'));
     $('safety-badge').textContent = 'THERMAL'; $('safety-badge').removeAttribute('data-state');
-    var check = M.solvePoisson(mesh, { conductivity: 1, boundary: function (n) { if (n.x === 0) return 100; if (Math.abs(n.x - mesh.width) < 1e-12) return 0; } });
-    var error = 0; mesh.nodes.forEach(function (n, i) { error = Math.max(error, Math.abs(check.values[i] - 100 * (1 - n.x / mesh.width))); });
-    clear($('mode-bars')); $('mode-bars').appendChild(hEl('p', 'panel-sub', 'With the heater off, T = 100(1 - x / width) is the exact solution. Maximum nodal error on this irregular mesh: ' + error.toExponential(2) + ' C.'));
-    var legend = $('legend-row'); clear(legend); HEAT_RAMP.forEach(function (color, i) { legend.appendChild(legendSwatch(color, fixed(field.min + (field.max - field.min) * i / 4, 0) + ' C')); });
-    legend.appendChild(hEl('span', 'legend-label', 'ARROWS = HEAT FLUX'));
+    var bars = $('mode-bars'); clear(bars);
+    var hist = (diagnostics.history && diagnostics.history.length > 1) ? diagnostics.history : [1, diagnostics.relativeResidual];
+    var W2 = 268, H2 = 64, pad = 5, lastX = 0, lastY = 0;
+    var pts = hist.map(function (v, i) {
+      var lg = Math.max(-16, Math.log10(Math.max(v, 1e-30)));
+      lastX = pad + (W2 - 2 * pad) * (hist.length === 1 ? 1 : i / (hist.length - 1));
+      lastY = pad + (H2 - 2 * pad) * (1 + lg / 16);
+      return fixed(lastX, 1) + ',' + fixed(lastY, 1);
+    }).join(' ');
+    var spark = svgEl('svg', { 'class': 'conv-spark', viewBox: '0 0 ' + W2 + ' ' + H2, role: 'img', 'aria-label': 'PCG relative residual versus iteration, log scale' });
+    spark.appendChild(svgEl('rect', { 'class': 'conv-frame', x: 0.5, y: 0.5, width: W2 - 1, height: H2 - 1 }));
+    spark.appendChild(svgEl('polyline', { points: pts, 'class': 'conv-line' }));
+    spark.appendChild(svgEl('circle', { 'class': 'conv-dot', cx: fixed(lastX, 1), cy: fixed(lastY, 1), r: 2.6 }));
+    bars.appendChild(spark);
+    bars.appendChild(hEl('div', 'conv-meta', 'rel residual ' + diagnostics.relativeResidual.toExponential(2) + ' in ' + diagnostics.iterations + ' iters / log10 axis 1 to 1e-16'));
+    var cacheKey = state.key + '|' + mesh.nodes.length + '|' + mesh.elements.length;
+    var checkText = 'No closed form on this domain. Flux balance and the PCG residual certify the solve.';
+    if (dom.patch === 'rect' || dom.patch === 'annulus') {
+      if (!(cacheKey in patchCheckCache)) {
+        var hot2 = new Set(mesh.bcSets.hot), cold2 = new Set(mesh.bcSets.cold);
+        var check = M.solvePoisson(mesh, { conductivity: 1, boundary: function (n, i) { if (hot2.has(i)) return 100; if (cold2.has(i)) return 0; } });
+        var err = 0;
+        mesh.nodes.forEach(function (n, i) {
+          var exact;
+          if (dom.patch === 'rect') exact = 100 * (1 - n.x / mesh.width);
+          else {
+            var rr = Math.hypot(n.x - mesh.meta.center.x, n.y - mesh.meta.center.y);
+            exact = 100 * Math.log(rr / mesh.meta.rOut) / Math.log(mesh.meta.rIn / mesh.meta.rOut);
+          }
+          err = Math.max(err, Math.abs(check.values[i] - exact));
+        });
+        patchCheckCache[cacheKey] = err;
+      }
+      checkText = dom.patch === 'rect'
+        ? 'With the heater off, T = 100(1 - x / width) is the exact solution. Maximum nodal error on this irregular mesh: ' + patchCheckCache[cacheKey].toExponential(2) + ' C.'
+        : 'T(r) = 100 ln(r/Rout) / ln(Rin/Rout) is the exact radial solution. Maximum nodal error on this mesh: ' + patchCheckCache[cacheKey].toExponential(2) + ' C.';
+    }
+    bars.appendChild(hEl('p', 'panel-sub', checkText));
+    var legend = $('legend-row'); clear(legend);
+    var scale2 = hEl('div', 'legend-scale');
+    scale2.appendChild(hEl('span', 'legend-tick', fixed(field.min, 0) + ' C'));
+    var grad = hEl('div', 'legend-ramp legend-grad');
+    for (var gi = 0; gi < 24; gi++) {
+      var seg = hEl('i'); seg.setAttribute('style', 'background:' + heatColor(field.min + (field.max - field.min) * gi / 23) + ';');
+      grad.appendChild(seg);
+    }
+    scale2.appendChild(grad);
+    scale2.appendChild(hEl('span', 'legend-tick', fixed(field.max, 0) + ' C'));
+    legend.appendChild(scale2);
+    legend.appendChild(hEl('span', 'legend-label', 'ARROW LENGTH = |q| / DOTS = NODES'));
     fieldTable(); renderFieldCanvas();
   }
   function renderVerification() {
@@ -1466,6 +1670,8 @@
 
     presetSel.addEventListener('change', function (e) {
       state.filter = 'all';
+      state.resolution = 1;
+      Array.prototype.forEach.call(document.getElementsByClassName('scenario-btn'), function (b) { b.setAttribute('aria-pressed', 'false'); });
       updateAnalysis((e.target && e.target.value) || state.key);
     });
     $('view-select').addEventListener('change', function (e) {
@@ -1477,9 +1683,15 @@
       renderAll();
     });
     $('scale-range').addEventListener('input', function (e) {
-      var scale = Number((e.target && e.target.value) || 100);
-      if (!isFinite(scale)) return;
-      state.scale = clamp(scale, 1, 500);
+      var v = Number((e.target && e.target.value) || 100);
+      if (!isFinite(v)) return;
+      if (state.kind === 'field') {
+        state.resolution = clamp(v, 0.5, 3);
+        $('scale-output').textContent = state.resolution + 'x';
+        updateAnalysis(state.key);
+        return;
+      }
+      state.scale = clamp(v, 1, 500);
       $('scale-output').textContent = state.scale + 'x';
       renderStats();
       renderCanvas();
@@ -1495,6 +1707,7 @@
         var scenarios = { bridge: ['pratt', 'force', 1, 100], crane: ['crane', 'deformed', 5, 50], plate: ['plate', 'stress', 1, 100], heat: ['heat', 'stress', 1, 100] };
         var scenario = scenarios[button.getAttribute('data-scenario')];
         state.view = scenario[1]; state.load = scenario[2]; state.scale = scenario[3]; state.filter = 'all';
+        state.resolution = 1;
         updateAnalysis(scenario[0]);
         Array.prototype.forEach.call(document.getElementsByClassName('scenario-btn'), function (b) { b.setAttribute('aria-pressed', b === button ? 'true' : 'false'); });
       });

@@ -76,8 +76,6 @@ html[data-theme="light"] {
 
 * { box-sizing: border-box; }
 
-html { scroll-behavior: smooth; }
-
 body {
   margin: 0;
   min-height: 100vh;
@@ -470,6 +468,15 @@ input[type="range"]::-moz-range-thumb {
 .svg-plate-hole { fill: none; stroke: var(--baseline); stroke-width: 1; stroke-dasharray: 3 3; }
 .svg-label { fill: var(--ink-2); font-family: var(--font-mono); font-size: 9.5px; }
 .svg-title { fill: var(--ink-3); font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em; }
+.svg-field-node { fill: var(--surface-2); stroke: var(--ink-3); stroke-width: 0.8; opacity: 0.7; }
+.svg-field-node:hover { stroke: var(--ink); opacity: 1; r: 3.4; }
+.conv-spark { display: block; width: 100%; height: auto; }
+.conv-frame { stroke: var(--grid); fill: var(--surface-2); }
+.conv-line { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+.conv-dot { fill: var(--accent); }
+.conv-meta { font-size: 10px; color: var(--ink-2); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.legend-grad { flex: 0 0 170px; }
+.legend-grad i { flex: 1; width: auto; }
 
 @media (max-width: 1080px) {
   .workspace { grid-template-columns: minmax(0, 1fr); }
@@ -493,17 +500,12 @@ input[type="range"]::-moz-range-thumb {
 
 /* The experiments lead directly to working numerical results. */
 .showcase { padding: 28px 28px 22px; background: var(--surface); border-bottom: 1px solid var(--line); }
-.showcase-intro { display: grid; grid-template-columns: 1fr auto; align-items: end; column-gap: 30px; }
 .eyebrow { color: var(--accent); font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 0.09em; }
-.showcase-intro .eyebrow { grid-column: 1 / -1; }
-.showcase h2 { margin: 7px 0 10px; font-size: clamp(23px, 3vw, 36px); font-weight: 650; letter-spacing: -0.04em; line-height: 1.15; }
-.showcase-intro p { max-width: 410px; margin: 0 0 12px; font-size: 12px; color: var(--ink-2); }
+.showcase h2 { margin: 0 0 18px; font-size: clamp(23px, 3vw, 36px); font-weight: 650; letter-spacing: -0.04em; line-height: 1.15; }
 .showcase-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.scenario-btn { text-align: left; padding: 15px 16px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-direction: column; gap: 7px; transition: border-color 0.15s, background 0.15s; }
+.scenario-btn { text-align: left; padding: 15px 16px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-direction: column; justify-content: center; min-height: 58px; gap: 7px; transition: border-color 0.15s, background 0.15s; }
 .scenario-btn:hover, .scenario-btn[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.scenario-index { color: var(--accent); font-size: 9px; font-family: var(--font-mono); letter-spacing: 0.04em; }
 .scenario-btn strong { font-size: 15px; letter-spacing: -0.02em; }
-.scenario-btn > span:last-child { font-size: 11px; color: var(--ink-2); }
 .field-load { min-width: 155px; width: 170px; }
 .inspection-panel { padding: 13px 20px; border-top: 1px solid var(--line); min-height: 90px; background: var(--surface-2); }
 .inspection-panel p { color: var(--ink-2); margin: 8px 0 0; font-size: 12px; }
@@ -518,7 +520,7 @@ input[type="range"]::-moz-range-thumb {
 .check-btn { border: 1px solid var(--accent); border-radius: var(--radius); padding: 9px 12px; color: var(--accent); background: var(--accent-soft); font-family: var(--font-mono); font-size: 9px; font-weight: 600; }
 #status-message { flex: 1 1 260px; color: var(--ink-2); font-size: 11px; margin: 0; overflow-wrap: anywhere; }
 .live-chip[data-state="critical"] { color: var(--critical); }
-#structure-svg { min-height: 0; aspect-ratio: 1000 / 520; }
+#structure-svg { min-height: 0; }
 .tooltip { max-width: min(250px, calc(100% - 16px)); }
 .table-scroll:focus-visible { outline-offset: -3px; }
 @media (min-width: 1500px) { .workspace { grid-template-columns: minmax(0, 1fr) 360px; } }

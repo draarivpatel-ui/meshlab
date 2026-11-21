@@ -66,7 +66,7 @@
       if (!(A.diagonal[i] > 0)) throw new Error('MeshLab: PCG requires a positive diagonal');
       z[i] = r[i] / A.diagonal[i]; p[i] = z[i];
     }
-    var normB = Math.sqrt(dot(b, b)), rz = dot(r, z), residual = normB, iteration = 0;
+    var normB = Math.sqrt(dot(b, b)), rz = dot(r, z), residual = normB, iteration = 0, history = [1];
     var target = tolerance * (normB || 1);
     while (residual > target && iteration < limit) {
       var Ap = multiply(A, p), curvature = dot(p, Ap);
@@ -81,6 +81,7 @@
         for (i = 0; i < n; i++) r[i] = b[i] - Ax[i];
         residual = Math.sqrt(dot(r, r));
       }
+      history.push(residual / (normB || 1));
       if (residual <= target) break;
       for (i = 0; i < n; i++) z[i] = r[i] / A.diagonal[i];
       var next = dot(r, z), beta = next / rz;
@@ -90,11 +91,22 @@
     var finalProduct = multiply(A, x);
     for (i = 0; i < n; i++) r[i] = b[i] - finalProduct[i];
     residual = Math.sqrt(dot(r, r));
+    history.push(residual / (normB || 1));
     return { solution: x, converged: residual <= target, iterations: iteration,
-      residual: residual, relativeResidual: residual / (normB || 1), nonzeros: A.values.length, method: 'Jacobi PCG' };
+      residual: residual, relativeResidual: residual / (normB || 1), nonzeros: A.values.length, method: 'Jacobi PCG', history: history };
   }
 
-  function triangulate(points) {
+  function pointInPolygon(x, y, polygon) {
+    var inside = false;
+    for (var i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      var xi = polygon[i][0], yi = polygon[i][1], xj = polygon[j][0], yj = polygon[j][1];
+      if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  function triangulate(points, opts) {
+    opts = opts || {};
     if (!Array.isArray(points)) throw new Error('MeshLab: triangulation needs points[]');
     var nodes = [], seen = new Set(), duplicates = 0;
     points.forEach(function (p) {
@@ -254,13 +266,193 @@
       }
     }
 
-    var elements = tris.map(function (t, id) { return { id: id, nodes: t }; });
-    if (!elements.length) throw new Error('MeshLab: points are collinear');
-    var edgeCounts = new Map(), minimumAngle = 180, totalArea = 0;
+    /* Domain filtering: drop triangles whose centroid leaves the polygon or enters a hole. */
+    var keepTris = tris;
+    var outerPoly = null, holePolys = [];
+    if (opts.polygon) {
+      if (!Array.isArray(opts.polygon) || opts.polygon.length < 3) throw new Error('MeshLab: polygon domain needs three vertices');
+      outerPoly = opts.polygon.map(function (v) { return [finite(Array.isArray(v) ? v[0] : v.x, 'polygon x'), finite(Array.isArray(v) ? v[1] : v.y, 'polygon y')]; });
+    }
+    if (opts.holes) {
+      if (!Array.isArray(opts.holes)) throw new Error('MeshLab: holes must be polygons[]');
+      opts.holes.forEach(function (hole) {
+        if (!Array.isArray(hole) || hole.length < 3) throw new Error('MeshLab: each hole needs three vertices');
+        holePolys.push(hole.map(function (v) { return [finite(Array.isArray(v) ? v[0] : v.x, 'hole x'), finite(Array.isArray(v) ? v[1] : v.y, 'hole y')]; }));
+      });
+    }
+    if (outerPoly || holePolys.length) {
+      /* A triangle survives only if its centroid and all three edge midpoints stay in the
+         domain. The midpoint test stops Delaunay edges that bridge notches or gaps (an edge
+         whose endpoints are both on the boundary can still cross void space). Midpoints that
+         sit on a polygon edge are kept via a small distance tolerance. */
+      var bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+      nodes.forEach(function (n) {
+        if (n.x < bx0) bx0 = n.x; if (n.x > bx1) bx1 = n.x;
+        if (n.y < by0) by0 = n.y; if (n.y > by1) by1 = n.y;
+      });
+      var epsClip = 1e-7 * Math.max(bx1 - bx0, by1 - by0, 1e-9);
+      var distToPoly = function (px, py, poly) {
+        var best = Infinity;
+        for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          var ax = poly[j][0], ay = poly[j][1], dx = poly[i][0] - ax, dy = poly[i][1] - ay;
+          var L = dx * dx + dy * dy;
+          var tt = L ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / L)) : 0;
+          var ex = px - (ax + tt * dx), ey = py - (ay + tt * dy);
+          if (ex * ex + ey * ey < best) best = ex * ex + ey * ey;
+        }
+        return Math.sqrt(best);
+      };
+      var inDomain = function (px, py) {
+        if (outerPoly && !pointInPolygon(px, py, outerPoly) && distToPoly(px, py, outerPoly) > epsClip) return false;
+        for (var h = 0; h < holePolys.length; h++)
+          if (pointInPolygon(px, py, holePolys[h]) && distToPoly(px, py, holePolys[h]) > epsClip) return false;
+        return true;
+      };
+      keepTris = tris.filter(function (t) {
+        var cx = 0, cy = 0;
+        t.forEach(function (id) { cx += nodes[id].x; cy += nodes[id].y; });
+        cx /= 3; cy /= 3;
+        if (!inDomain(cx, cy)) return false;
+        for (var e = 0; e < 3; e++) {
+          var mx = (nodes[t[e]].x + nodes[t[(e + 1) % 3]].x) / 2, my = (nodes[t[e]].y + nodes[t[(e + 1) % 3]].y) / 2;
+          if (!inDomain(mx, my)) return false;
+        }
+        return true;
+      });
+      /* Stair-step cleanup: keep the largest edge-connected component, then drop degenerate
+         boundary slivers until none remain. Removing a boundary sliver merges its pocket
+         into the outside, so both connectivity and Euler characteristic converge. */
+      var minAngleOf = function (t) {
+        var p = t.map(function (id) { return nodes[id]; });
+        var worst = 180;
+        for (var e = 0; e < 3; e++) {
+          var u = p[(e + 1) % 3], v = p[(e + 2) % 3], o = p[e];
+          var ux = u.x - o.x, uy = u.y - o.y, vx = v.x - o.x, vy = v.y - o.y;
+          var cs = (ux * vx + uy * vy) / Math.sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy) || 1);
+          worst = Math.min(worst, Math.acos(Math.max(-1, Math.min(1, cs))) * 180 / Math.PI);
+        }
+        return worst;
+      };
+      for (var clean = 0; clean < 120; clean++) {
+        var triByEdge = new Map();
+        keepTris.forEach(function (t, i) {
+          for (var ei = 0; ei < 3; ei++) {
+            var ea = Math.min(t[ei], t[(ei + 1) % 3]), eb = Math.max(t[ei], t[(ei + 1) % 3]), ekey = ea + ':' + eb;
+            if (!triByEdge.has(ekey)) triByEdge.set(ekey, []);
+            triByEdge.get(ekey).push(i);
+          }
+        });
+        var comp = new Int32Array(keepTris.length).fill(-1), stack = [], compCount = 0;
+        keepTris.forEach(function (t, i) {
+          if (comp[i] >= 0) return;
+          stack.push(i); comp[i] = compCount;
+          while (stack.length) {
+            var ti = stack.pop();
+            for (var e2 = 0; e2 < 3; e2++) {
+              var a2 = Math.min(keepTris[ti][e2], keepTris[ti][(e2 + 1) % 3]), b2 = Math.max(keepTris[ti][e2], keepTris[ti][(e2 + 1) % 3]);
+              (triByEdge.get(a2 + ':' + b2) || []).forEach(function (t2) { if (comp[t2] < 0) { comp[t2] = compCount; stack.push(t2); } });
+            }
+          }
+          compCount++;
+        });
+        if (compCount > 1) {
+          var sizes = new Map();
+          for (var ci = 0; ci < keepTris.length; ci++) sizes.set(comp[ci], (sizes.get(comp[ci]) || 0) + 1);
+          var bestComp = 0, bestSize = -1;
+          sizes.forEach(function (sz, c) { if (sz > bestSize) { bestSize = sz; bestComp = c; } });
+          keepTris = keepTris.filter(function (t, i) { return comp[i] === bestComp; });
+          continue;
+        }
+        var drop = -1, dropAngle = 4.5;
+        keepTris.forEach(function (t, i) {
+          if (drop !== -1) return;
+          var bound = 0;
+          for (var e3 = 0; e3 < 3; e3++) {
+            var a3 = Math.min(t[e3], t[(e3 + 1) % 3]), b3 = Math.max(t[e3], t[(e3 + 1) % 3]);
+            if ((triByEdge.get(a3 + ':' + b3) || []).length === 1) bound++;
+          }
+          if (!bound) return;
+          var ang = minAngleOf(t);
+          if (ang < dropAngle) { drop = i; dropAngle = ang; }
+        });
+        if (drop !== -1) { keepTris.splice(drop, 1); continue; }
+        /* Phantom-void check: walk directed boundary edges head to tail. A void that touches
+           the outside at one vertex still counts as its own loop, matching the Euler count. */
+        var boundDir = [];
+        keepTris.forEach(function (t, i) {
+          for (var e4 = 0; e4 < 3; e4++) {
+            var u4 = t[e4], v4 = t[(e4 + 1) % 3];
+            var k4 = Math.min(u4, v4) + ':' + Math.max(u4, v4);
+            if ((triByEdge.get(k4) || []).length === 1) boundDir.push({ u: u4, v: v4, t: i });
+          }
+        });
+        var outMap = new Map();
+        boundDir.forEach(function (be, idx) {
+          if (!outMap.has(be.u)) outMap.set(be.u, []);
+          outMap.get(be.u).push(idx);
+        });
+        var visited = new Uint8Array(boundDir.length), loopId = new Int32Array(boundDir.length).fill(-1), loopSizes = [], loops = 0;
+        boundDir.forEach(function (_, idx) {
+          if (visited[idx]) return;
+          var count = 0, cur = idx, guard = 0;
+          while (!visited[cur] && guard++ <= boundDir.length) {
+            visited[cur] = 1; loopId[cur] = loops; count++;
+            /* Half-edge boundary rule: next edge is CCW-first after the reversed incoming
+               direction, keeping pinched loops (vertex-touching voids) separate. */
+            var be = boundDir[cur], pv = nodes[be.v], pu = nodes[be.u];
+            var phi = Math.atan2(pu.y - pv.y, pu.x - pv.x);
+            var outs = outMap.get(be.v) || [], nxtIdx = -1, bestTurn = Infinity;
+            for (var q4 = 0; q4 < outs.length; q4++) {
+              var oi = outs[q4];
+              if (visited[oi]) continue;
+              var pw = nodes[boundDir[oi].v];
+              var turn = Math.atan2(pw.y - pv.y, pw.x - pv.x) - phi;
+              while (turn <= 0) turn += 2 * Math.PI;
+              while (turn > 2 * Math.PI) turn -= 2 * Math.PI;
+              if (turn < bestTurn) { bestTurn = turn; nxtIdx = oi; }
+            }
+            if (nxtIdx === -1) break;
+            cur = nxtIdx;
+          }
+          loopSizes.push(count); loops++;
+        });
+        if (loops <= (outerPoly ? 1 : 0) + holePolys.length) break;
+        var smallestLoop = 0;
+        loopSizes.forEach(function (sz, l) { if (sz < loopSizes[smallestLoop]) smallestLoop = l; });
+        var drop2 = -1, dropArea = Infinity;
+        boundDir.forEach(function (be, idx) {
+          if (loopId[idx] !== smallestLoop) return;
+          var p = keepTris[be.t].map(function (id) { return nodes[id]; });
+          var ar = Math.abs((p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[2].x - p[0].x) * (p[1].y - p[0].y)) / 2;
+          if (ar < dropArea) { dropArea = ar; drop2 = be.t; }
+        });
+        if (drop2 === -1) break;
+        keepTris.splice(drop2, 1);
+      }
+    }
+    keepTris = keepTris.filter(function (t) { return Math.abs(orient(t[0], t[1], t[2])) > 1e-18; });
+    var usedNodes = new Set();
+    keepTris.forEach(function (t) { t.forEach(function (id) { usedNodes.add(id); }); });
+    if (usedNodes.size < nodes.length) {
+      var remap = new Int32Array(nodes.length).fill(-1), keptNodes = [];
+      nodes.forEach(function (node) {
+        if (usedNodes.has(node.id)) { remap[node.id] = keptNodes.length; keptNodes.push({ id: keptNodes.length, x: node.x, y: node.y }); }
+      });
+      keepTris = keepTris.map(function (t) { return [remap[t[0]], remap[t[1]], remap[t[2]]]; });
+      nodes = keptNodes;
+    }
+    var elements = keepTris.map(function (t, id) { return { id: id, nodes: t }; });
+    if (!elements.length) throw new Error('MeshLab: domain leaves no triangles inside');
+    var edgeCounts = new Map(), minimumAngle = 180, totalArea = 0, minArea = Infinity, maxRadiusEdge = 0;
     elements.forEach(function (el) {
-      var p = el.nodes.map(function (id) { return pts[id]; });
-      var area = Math.abs((p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[2].x - p[0].x) * (p[1].y - p[0].y)) / 2;
-      totalArea += area * span * span;
+      var p = el.nodes.map(function (id) { return nodes[id]; });
+      var cross = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[2].x - p[0].x) * (p[1].y - p[0].y);
+      var area = Math.abs(cross) / 2;
+      totalArea += area;
+      if (area < minArea) minArea = area;
+      var l01 = Math.hypot(p[1].x - p[0].x, p[1].y - p[0].y), l12 = Math.hypot(p[2].x - p[1].x, p[2].y - p[1].y), l20 = Math.hypot(p[0].x - p[2].x, p[0].y - p[2].y);
+      var shortest = Math.min(l01, l12, l20);
+      if (area > 0 && shortest > 0) maxRadiusEdge = Math.max(maxRadiusEdge, (l01 * l12 * l20) / (4 * area * shortest));
       for (var e = 0; e < 3; e++) {
         var a = el.nodes[e], b = el.nodes[(e + 1) % 3], key = Math.min(a, b) + ':' + Math.max(a, b);
         edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1);
@@ -270,10 +462,14 @@
         minimumAngle = Math.min(minimumAngle, Math.acos(Math.max(-1, Math.min(1, cosine))) * 180 / Math.PI);
       }
     });
-    var boundarySet = new Set();
-    edgeCounts.forEach(function (count, key) { if (count === 1) key.split(':').forEach(function (id) { boundarySet.add(Number(id)); }); });
+    var boundaryEdges = 0, boundarySet = new Set();
+    edgeCounts.forEach(function (count, key) {
+      if (count === 1) { boundaryEdges++; key.split(':').forEach(function (id) { boundarySet.add(Number(id)); }); }
+    });
     return { nodes: nodes, elements: elements, boundaryNodes: Array.from(boundarySet).sort(function (a, b) { return a - b; }),
-      width: width, height: height, quality: { minimumAngle: minimumAngle, area: totalArea }, duplicatesRemoved: duplicates };
+      width: width, height: height, edges: edgeCounts.size, boundaryEdges: boundaryEdges,
+      chi: nodes.length - edgeCounts.size + elements.length,
+      quality: { minimumAngle: minimumAngle, area: totalArea, minArea: minArea, maxRadiusEdge: maxRadiusEdge }, duplicatesRemoved: duplicates };
   }
 
   function generateFieldMesh(nx, ny, width, height) {
@@ -291,6 +487,141 @@
     var mesh = triangulate(pts);
     mesh.nx = nx; mesh.ny = ny; mesh.leftNodes = []; mesh.rightNodes = [];
     mesh.nodes.forEach(function (n) { if (n.x === 0) mesh.leftNodes.push(n.id); if (Math.abs(n.x - width) < 1e-12) mesh.rightNodes.push(n.id); });
+    mesh.bcSets = { hot: mesh.leftNodes.slice(), cold: mesh.rightNodes.slice() };
+    mesh.domainSpec = { type: 'rect', nx: nx, ny: ny, width: width, height: height };
+    return mesh;
+  }
+
+  /* Boundary-edge sampling at spacing <= ds so domain edges become mesh edges. */
+  function samplePolygonEdge(pts, ax, ay, bx, by, ds) {
+    var steps = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / ds));
+    for (var s = 0; s <= steps; s++) pts.push({ x: ax + (bx - ax) * s / steps, y: ay + (by - ay) * s / steps });
+  }
+  function samplePolygon(pts, poly, ds) {
+    for (var i = 0; i < poly.length; i++) {
+      var a = poly[i], b = poly[(i + 1) % poly.length];
+      samplePolygonEdge(pts, a[0], a[1], b[0], b[1], ds);
+    }
+  }
+  /* Minimum distance from (x, y) to the segments of every polygon in `polys`. */
+  function distToEdges(x, y, polys) {
+    var best = Infinity;
+    polys.forEach(function (poly) {
+      for (var i = 0; i < poly.length; i++) {
+        var a = poly[i], b = poly[(i + 1) % poly.length];
+        var vx = b[0] - a[0], vy = b[1] - a[1], wx = x - a[0], wy = y - a[1];
+        var t = Math.max(0, Math.min(1, (wx * vx + wy * vy) / (vx * vx + vy * vy || 1)));
+        var dx = wx - t * vx, dy = wy - t * vy, d = dx * dx + dy * dy;
+        if (d < best) best = d;
+      }
+    });
+    return Math.sqrt(best);
+  }
+
+  function gridInterior(pts, xmin, ymin, xmax, ymax, nx, ny, inside, clear) {
+    for (var j = 1; j < ny; j++) for (var i = 1; i < nx; i++) {
+      var bx = xmin + (xmax - xmin) * i / nx, by = ymin + (ymax - ymin) * j / ny;
+      if (!inside(bx, by) || (clear && !clear(bx, by))) continue;
+      var jx = 0.16 * Math.sin(i * 17 + j * 31) * (xmax - xmin) / nx;
+      var jy = 0.16 * Math.cos(i * 23 + j * 13) * (ymax - ymin) / ny;
+      var x = bx + jx, y = by + jy;
+      if (inside(x, y) && (!clear || clear(x, y))) pts.push({ x: x, y: y });
+      else if (!clear || clear(bx, by)) pts.push({ x: bx, y: by });
+    }
+  }
+
+  function generateDomainMesh(spec) {
+    spec = spec || {};
+    var type = spec.type || 'rect';
+    if (type === 'rect') {
+      return generateFieldMesh(spec.nx === undefined ? 14 : spec.nx, spec.ny === undefined ? 10 : spec.ny,
+        spec.width === undefined ? 2.4 : spec.width, spec.height === undefined ? 1.6 : spec.height);
+    }
+    var nx = spec.nx === undefined ? 20 : spec.nx, ny = spec.ny === undefined ? 16 : spec.ny;
+    var width = spec.width === undefined ? 2.4 : spec.width, height = spec.height === undefined ? 1.6 : spec.height;
+    if (!Number.isInteger(nx) || !Number.isInteger(ny) || nx < 2 || ny < 2 || nx > 60 || ny > 60 ||
+        !(width > 0 && height > 0)) throw new Error('MeshLab: invalid domain mesh dimensions');
+    var ds = Math.min(width / nx, height / ny), pts = [], polygon = null, holes = [], inside = null, bcSets = null, meta = {};
+
+    if (type === 'l') {
+      var x1 = width * 0.5, y1 = height * 0.5;
+      polygon = [[0, 0], [width, 0], [width, y1], [x1, y1], [x1, height], [0, height]];
+      inside = function (x, y) { return pointInPolygon(x, y, polygon); };
+      var clearL = function (x, y) { return distToEdges(x, y, [polygon]) > 0.35 * ds; };
+      samplePolygon(pts, polygon, ds);
+      gridInterior(pts, 0, 0, width, height, nx, ny, inside, clearL);
+      bcSets = 'lr';
+      meta = { notchX: x1, notchY: y1 };
+    } else if (type === 'annulus') {
+      var cx = width / 2, cy = height / 2, rOut = Math.min(width, height) / 2;
+      var rIn = rOut * (spec.ratio === undefined ? 0.35 : finite(spec.ratio, 'annulus ratio'));
+      if (!(rIn > 0 && rIn < rOut * 0.95)) throw new Error('MeshLab: invalid annulus ratio');
+      var nOut = Math.max(48, Math.ceil(Math.PI * 2 * rOut / ds)), nIn = Math.max(28, Math.ceil(Math.PI * 2 * rIn / ds));
+      polygon = [];
+      for (var oi = 0; oi < nOut; oi++) {
+        var th = 2 * Math.PI * oi / nOut;
+        polygon.push([cx + rOut * Math.cos(th), cy + rOut * Math.sin(th)]);
+        pts.push({ x: polygon[oi][0], y: polygon[oi][1] });
+      }
+      var hole = [];
+      for (var hi = 0; hi < nIn; hi++) {
+        var th2 = 2 * Math.PI * hi / nIn;
+        hole.push([cx + rIn * Math.cos(th2), cy + rIn * Math.sin(th2)]);
+        pts.push({ x: hole[hi][0], y: hole[hi][1] });
+      }
+      holes.push(hole);
+      inside = function (x, y) { var r = Math.hypot(x - cx, y - cy); return r < rOut - 1e-9 && r > rIn + 1e-9; };
+      var clearA = function (x, y) { return distToEdges(x, y, [polygon, hole]) > 0.3 * ds; };
+      var rings = Math.max(2, Math.round((rOut - rIn) / ds));
+      for (var rk = 1; rk < rings; rk++) {
+        var rr = rIn + (rOut - rIn) * rk / rings;
+        var count = Math.max(6, Math.round(2 * Math.PI * rr / ds));
+        for (var ri = 0; ri < count; ri++) {
+          var base = 2 * Math.PI * (ri + 0.5 * (rk % 2)) / count;
+          var jr = rr + 0.10 * ds * Math.sin(ri * 19 + rk * 29), jt = base + 0.10 * ds / rr * Math.cos(ri * 13 + rk * 7);
+          var ax = cx + jr * Math.cos(jt), ay = cy + jr * Math.sin(jt);
+          if (inside(ax, ay) && clearA(ax, ay)) pts.push({ x: ax, y: ay });
+        }
+      }
+      bcSets = 'annulus';
+      meta = { center: { x: cx, y: cy }, rIn: rIn, rOut: rOut };
+    } else if (type === 'sink') {
+      var baseH = height * 0.45, fins = spec.fins === undefined ? 5 : spec.fins;
+      if (!Number.isInteger(fins) || fins < 1 || fins > 12) throw new Error('MeshLab: invalid fin count');
+      var period = width / fins;
+      polygon = [[0, 0], [width, 0], [width, baseH]];
+      for (var fi = fins - 1; fi >= 0; fi--) {
+        var fr = fi * period + period * 0.75, fl = fi * period + period * 0.25;
+        polygon.push([fr, baseH], [fr, height], [fl, height], [fl, baseH]);
+      }
+      polygon.push([0, baseH]);
+      inside = function (x, y) { return pointInPolygon(x, y, polygon); };
+      var clearS = function (x, y) { return distToEdges(x, y, [polygon]) > 0.35 * ds; };
+      samplePolygon(pts, polygon, ds);
+      gridInterior(pts, 0, 0, width, height, nx, ny, inside, clearS);
+      bcSets = 'sink';
+      meta = { baseH: baseH, fins: fins };
+    } else {
+      throw new Error('MeshLab: unknown domain type');
+    }
+
+    var mesh = triangulate(pts, { polygon: polygon, holes: holes });
+    mesh.domainSpec = { type: type, nx: nx, ny: ny, width: width, height: height, ratio: spec.ratio, fins: spec.fins };
+    mesh.meta = meta;
+    var boundary = new Set(mesh.boundaryNodes);
+    var hot = [], cold = [];
+    mesh.nodes.forEach(function (node) {
+      if (!boundary.has(node.id)) return;
+      if (bcSets === 'lr') { if (node.x < ds * 0.5) hot.push(node.id); else if (node.x > width - ds * 0.5) cold.push(node.id); }
+      else if (bcSets === 'annulus') {
+        var r = Math.hypot(node.x - meta.center.x, node.y - meta.center.y);
+        if (Math.abs(r - meta.rIn) < Math.abs(r - meta.rOut)) hot.push(node.id); else cold.push(node.id);
+      } else if (bcSets === 'sink') {
+        if (node.y < ds * 0.5) hot.push(node.id); else cold.push(node.id);
+      }
+    });
+    if (!hot.length || !cold.length) throw new Error('MeshLab: domain boundary sets are incomplete');
+    mesh.bcSets = { hot: hot, cold: cold };
     return mesh;
   }
 
@@ -311,8 +642,17 @@
       var gx = [(p[1].y - p[2].y) / cross, (p[2].y - p[0].y) / cross, (p[0].y - p[1].y) / cross];
       var gy = [(p[2].x - p[1].x) / cross, (p[0].x - p[2].x) / cross, (p[1].x - p[0].x) / cross];
       var centroid = { x: (p[0].x + p[1].x + p[2].x) / 3, y: (p[0].y + p[1].y + p[2].y) / 3 };
-      var source = typeof cfg.source === 'function' ? cfg.source(centroid.x, centroid.y) : (cfg.source === undefined ? 0 : cfg.source);
-      finite(source, 'heat source');
+      var source;
+      if (typeof cfg.source === 'function') {
+        /* Mid-edge rule: integrates quadratics exactly, tighter than a centroid sample for the Gaussian heater. */
+        var m01x = (p[0].x + p[1].x) / 2, m01y = (p[0].y + p[1].y) / 2;
+        var m12x = (p[1].x + p[2].x) / 2, m12y = (p[1].y + p[2].y) / 2;
+        var m20x = (p[2].x + p[0].x) / 2, m20y = (p[2].y + p[0].y) / 2;
+        source = (finite(cfg.source(m01x, m01y), 'heat source') + finite(cfg.source(m12x, m12y), 'heat source') + finite(cfg.source(m20x, m20y), 'heat source')) / 3;
+      } else {
+        source = cfg.source === undefined ? 0 : cfg.source;
+        finite(source, 'heat source');
+      }
       el.nodes.forEach(function (a, i) {
         b[a] += source * area / 3;
         el.nodes.forEach(function (c, j) { rows[a].set(c, (rows[a].get(c) || 0) + conductivity * area * (gx[i] * gx[j] + gy[i] * gy[j])); });
@@ -351,13 +691,76 @@
       residuals[i] -= b[i]; sourceTotal += b[i];
       if (prescribed.has(i)) reaction += residuals[i]; else freeResidual = Math.max(freeResidual, Math.abs(residuals[i]));
     }
-    return { mesh: mesh, values: Array.from(values), elements: elements,
+    /* Area-weighted nodal flux for exact per-node (x, y, u, |grad u|) inspection. */
+    var nodeFlux = mesh.nodes.map(function () { return { x: 0, y: 0, w: 0 }; });
+    elements.forEach(function (e) {
+      e.nodes.forEach(function (id) {
+        nodeFlux[id].x += e.fluxX * e.area; nodeFlux[id].y += e.fluxY * e.area; nodeFlux[id].w += e.area;
+      });
+    });
+    nodeFlux = nodeFlux.map(function (nf) { return nf.w > 0 ? { x: nf.x / nf.w, y: nf.y / nf.w } : { x: 0, y: 0 }; });
+    return { mesh: mesh, values: Array.from(values), elements: elements, nodeFlux: nodeFlux,
       min: Math.min.apply(null, Array.from(values)), max: Math.max.apply(null, Array.from(values)),
       energy: elements.reduce(function (s, e) { return s + e.energy; }, 0), diagnostics: result,
       verification: { freeResidual: freeResidual, balanceResidual: sourceTotal + reaction, sourceTotal: sourceTotal, boundaryFlux: reaction },
       freeDofs: free, conductivity: conductivity };
   }
 
+  /* VTK legacy ASCII UNSTRUCTURED_GRID. Elements: 2 nodes -> VTK_LINE (3), 3 -> VTK_TRIANGLE (5), 4 -> VTK_QUAD (9). */
+  function exportVtk(mesh, data) {
+    if (!mesh || !Array.isArray(mesh.nodes) || !Array.isArray(mesh.elements) || !mesh.nodes.length || !mesh.elements.length) {
+      throw new Error('MeshLab: VTK export needs a mesh');
+    }
+    data = data || {};
+    var n = mesh.nodes.length, m = mesh.elements.length;
+    var cellTypes = { 2: 3, 3: 5, 4: 9 };
+    var cellInts = 0;
+    mesh.elements.forEach(function (el) {
+      if (!el.nodes || !cellTypes[el.nodes.length]) throw new Error('MeshLab: VTK export supports line/triangle/quad cells');
+      el.nodes.forEach(function (id) { if (!Number.isInteger(id) || id < 0 || id >= n) throw new Error('MeshLab: VTK export found an invalid node reference'); });
+      cellInts += el.nodes.length + 1;
+    });
+    var title = String(data.title === undefined ? 'MeshLab unstructured grid' : data.title).replace(/[\r\n]+/g, ' ').slice(0, 255);
+    var num = function (v) {
+      var x = finite(Number(v), 'VTK value');
+      if (x === 0) x = 0;
+      return String(x);
+    };
+    var lines = ['# vtk DataFile Version 3.0', title, 'ASCII', 'DATASET UNSTRUCTURED_GRID', 'POINTS ' + n + ' float'];
+    mesh.nodes.forEach(function (node) { lines.push(num(node.x) + ' ' + num(node.y) + ' ' + num(node.z || 0)); });
+    lines.push('CELLS ' + m + ' ' + cellInts);
+    mesh.elements.forEach(function (el) { lines.push(el.nodes.length + ' ' + el.nodes.join(' ')); });
+    lines.push('CELL_TYPES ' + m);
+    mesh.elements.forEach(function (el) { lines.push(String(cellTypes[el.nodes.length])); });
+    function block(setKey, count, scalars, vectors) {
+      scalars = scalars || []; vectors = vectors || [];
+      if (!scalars.length && !vectors.length) return;
+      lines.push(setKey + ' ' + count);
+      scalars.concat(vectors).forEach(function (field) {
+        if (!field || typeof field.name !== 'string' || !field.name.length) throw new Error('MeshLab: VTK field needs a name');
+        if (!/^[-\w.]+$/.test(field.name)) throw new Error('MeshLab: VTK field name must be a single word');
+        var isVector = vectors.indexOf(field) !== -1;
+        if (!Array.isArray(field.values) || field.values.length !== count) throw new Error('MeshLab: VTK field ' + field.name + ' length mismatch');
+        if (isVector) {
+          lines.push('VECTORS ' + field.name + ' float');
+          field.values.forEach(function (v) {
+            if (!v) throw new Error('MeshLab: VTK vector entry missing');
+            var vx = Array.isArray(v) ? v[0] : v.x, vy = Array.isArray(v) ? v[1] : v.y, vz = Array.isArray(v) ? v[2] : (v.z === undefined ? 0 : v.z);
+            lines.push(num(vx) + ' ' + num(vy) + ' ' + num(vz));
+          });
+        } else {
+          lines.push('SCALARS ' + field.name + ' float 1');
+          lines.push('LOOKUP_TABLE default');
+          field.values.forEach(function (v) { lines.push(num(v)); });
+        }
+      });
+    }
+    block('POINT_DATA', n, data.pointScalars, data.pointVectors);
+    block('CELL_DATA', m, data.cellScalars, data.cellVectors);
+    return lines.join('\n') + '\n';
+  }
+
   return { toCSR: toCSR, multiply: multiply, solvePCG: solvePCG, triangulate: triangulate,
-    generateFieldMesh: generateFieldMesh, solvePoisson: solvePoisson };
+    generateFieldMesh: generateFieldMesh, generateDomainMesh: generateDomainMesh, solvePoisson: solvePoisson,
+    exportVtk: exportVtk, pointInPolygon: pointInPolygon };
 });

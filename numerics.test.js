@@ -224,3 +224,162 @@ test('skinny triangles near a convex hull edge are preserved without dropping in
   close(mesh.quality.area, 0.5, 1e-12);
 });
 
+/* ------------------------------------------------------------------ */
+/* Domain meshes, MMS convergence, PCG history, nodal flux, VTK        */
+/* ------------------------------------------------------------------ */
+
+test('generated domains are connected, oriented and carry the right Euler characteristic', () => {
+  for (const [type, chi] of [['l', 1], ['annulus', 0], ['sink', 1]]) {
+    const mesh = F.generateDomainMesh({ type, nx: 16, ny: 12, width: 2, height: 2, fins: 4 });
+    assert.equal(mesh.chi, chi, type + ' Euler');
+    assert.ok(mesh.quality.minimumAngle > 5, type + ' min angle ' + mesh.quality.minimumAngle);
+    assert.ok(mesh.bcSets.hot.length && mesh.bcSets.cold.length, type + ' boundary sets');
+    for (const e of mesh.elements) {
+      const [a, b, c] = e.nodes.map(id => mesh.nodes[id]);
+      assert.ok((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) > 0, type + ' CCW');
+    }
+    const edgeUse = new Map(), adj = mesh.nodes.map(() => []);
+    mesh.elements.forEach(e => e.nodes.forEach((u, i) => {
+      const v = e.nodes[(i + 1) % 3], k = Math.min(u, v) + ':' + Math.max(u, v);
+      edgeUse.set(k, (edgeUse.get(k) || 0) + 1); adj[u].push(v); adj[v].push(u);
+    }));
+    for (const c of edgeUse.values()) assert.ok(c <= 2, type + ' non-manifold edge');
+    const seen = new Set([0]), stack = [0];
+    while (stack.length) for (const nxt of adj[stack.pop()]) if (!seen.has(nxt)) { seen.add(nxt); stack.push(nxt); }
+    assert.equal(seen.size, mesh.nodes.length, type + ' connected');
+    assert.equal(new Set(mesh.elements.flatMap(e => e.nodes)).size, mesh.nodes.length, type + ' no orphans');
+  }
+});
+
+test('interior edges of generated domain meshes satisfy the local Delaunay criterion', () => {
+  const mesh = F.generateDomainMesh({ type: 'l', nx: 12, ny: 12, width: 2, height: 2 });
+  const inc = new Map();
+  mesh.elements.forEach((e, k) => e.nodes.forEach((u, i) => {
+    const v = e.nodes[(i + 1) % 3], w = e.nodes[(i + 2) % 3];
+    const key = Math.min(u, v) + ':' + Math.max(u, v);
+    if (!inc.has(key)) inc.set(key, []);
+    inc.get(key).push(w);
+  }));
+  function circle(a, b, c) {
+    const d = 2 * ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+    const bx = b.x - a.x, by = b.y - a.y, cx = c.x - a.x, cy = c.y - a.y;
+    const x = a.x + ((bx * bx + by * by) * cy - (cx * cx + cy * cy) * by) / d;
+    const y = a.y + ((cx * cx + cy * cy) * bx - (bx * bx + by * by) * cx) / d;
+    return { x, y, r2: (x - a.x) ** 2 + (y - a.y) ** 2 };
+  }
+  let checked = 0;
+  for (const [key, tri] of inc) {
+    if (tri.length !== 2) continue;
+    const [u, v] = key.split(':').map(Number);
+    const A = mesh.nodes[tri[0]], B = mesh.nodes[tri[1]], U = mesh.nodes[u], V = mesh.nodes[v];
+    const ca = circle(U, V, A), cb = circle(U, V, B);
+    assert.ok((B.x - ca.x) ** 2 + (B.y - ca.y) ** 2 >= ca.r2 - 1e-9, 'Delaunay violated on edge ' + key);
+    assert.ok((A.x - cb.x) ** 2 + (A.y - cb.y) ** 2 >= cb.r2 - 1e-9, 'Delaunay violated on edge ' + key);
+    checked++;
+  }
+  assert.ok(checked > 50);
+});
+
+test('manufactured Poisson solution converges at second order in the mesh size', () => {
+  const exact = (x, y) => Math.sin(Math.PI * x) * Math.sin(Math.PI * y);
+  const source = (x, y) => 2 * Math.PI * Math.PI * Math.sin(Math.PI * x) * Math.sin(Math.PI * y);
+  const boundary = n => (n.x === 0 || n.y === 0 || Math.abs(n.x - 1) < 1e-12 || Math.abs(n.y - 1) < 1e-12) ? 0 : undefined;
+  const errors = [];
+  for (const n of [8, 16, 32]) {
+    const mesh = F.generateFieldMesh(n, n, 1, 1);
+    const s = F.solvePoisson(mesh, { source, boundary });
+    let num = 0, den = 0;
+    s.values.forEach((v, i) => { const e = v - exact(mesh.nodes[i].x, mesh.nodes[i].y); num += e * e; den += exact(mesh.nodes[i].x, mesh.nodes[i].y) ** 2; });
+    errors.push(Math.sqrt(num / den));
+  }
+  assert.ok(errors[0] > errors[1] && errors[1] > errors[2], 'errors decrease ' + errors.join(','));
+  const order = Math.log2(errors[0] / errors[2]) / 2;
+  assert.ok(order > 1.7 && order < 2.6, 'convergence order ' + order);
+});
+
+test('Dirichlet boundary values hold exactly and PCG reports its residual history', () => {
+  const mesh = F.generateFieldMesh(10, 8, 2, 1);
+  const s = F.solvePoisson(mesh, { conductivity: 1, source: 5, boundary: n => n.x === 0 ? 37.5 : Math.abs(n.x - 2) < 1e-12 ? -12.25 : undefined });
+  mesh.nodes.forEach((n, i) => {
+    if (n.x === 0) assert.equal(s.values[i], 37.5);
+    if (Math.abs(n.x - 2) < 1e-12) assert.equal(s.values[i], -12.25);
+  });
+  const h = s.diagnostics.history;
+  assert.ok(h.length >= 2); assert.equal(h[0], 1);
+  assert.ok(Math.abs(h[h.length - 1] - s.diagnostics.relativeResidual) < 1e-14);
+  assert.ok(s.diagnostics.relativeResidual < 1e-10);
+  assert.ok(s.diagnostics.iterations <= h.length);
+});
+
+test('annulus mesh preserves the hole, boundary sets and the exact radial profile', () => {
+  const mesh = F.generateDomainMesh({ type: 'annulus', nx: 24, ny: 20, width: 2, height: 2, ratio: 0.35 });
+  assert.equal(mesh.chi, 0);
+  const rIn = mesh.meta.rIn, rOut = mesh.meta.rOut, c = mesh.meta.center;
+  close(mesh.quality.area, Math.PI * (rOut * rOut - rIn * rIn), 0.1);
+  const hot = new Set(mesh.bcSets.hot), cold = new Set(mesh.bcSets.cold);
+  mesh.nodes.forEach((n, i) => {
+    const r = Math.hypot(n.x - c.x, n.y - c.y);
+    if (hot.has(i)) assert.ok(r < (rIn + rOut) / 2);
+    if (cold.has(i)) assert.ok(r > (rIn + rOut) / 2);
+  });
+  const s = F.solvePoisson(mesh, { boundary: (n, i) => hot.has(i) ? 100 : cold.has(i) ? 0 : undefined });
+  let err = 0;
+  s.values.forEach((v, i) => {
+    const r = Math.hypot(mesh.nodes[i].x - c.x, mesh.nodes[i].y - c.y);
+    err = Math.max(err, Math.abs(v - 100 * Math.log(r / rOut) / Math.log(rIn / rOut)));
+  });
+  assert.ok(err < 0.5, 'radial solution error ' + err);
+});
+
+test('nodal flux is the area weighted element flux', () => {
+  const mesh = F.generateFieldMesh(8, 6, 2, 1);
+  const s = F.solvePoisson(mesh, { conductivity: 1, boundary: n => n.x === 0 ? 100 : Math.abs(n.x - 2) < 1e-12 ? 0 : undefined });
+  assert.equal(s.nodeFlux.length, mesh.nodes.length);
+  const acc = mesh.nodes.map(() => ({ x: 0, y: 0, w: 0 }));
+  s.elements.forEach(e => e.nodes.forEach(id => { acc[id].x += e.fluxX * e.area; acc[id].y += e.fluxY * e.area; acc[id].w += e.area; }));
+  acc.forEach((a, i) => { close(s.nodeFlux[i].x, a.x / a.w, 1e-12); close(s.nodeFlux[i].y, a.y / a.w, 1e-12); });
+  mesh.nodes.forEach((n, i) => {
+    if (n.x > 0.3 && n.x < 1.7) { close(s.nodeFlux[i].x, 50, 1e-9); close(s.nodeFlux[i].y, 0, 1e-9); }
+  });
+});
+
+test('VTK export writes a valid legacy unstructured grid and guards its inputs', () => {
+  const mesh = F.generateFieldMesh(6, 4, 2, 1);
+  const s = F.solvePoisson(mesh, { boundary: n => mesh.boundaryNodes.includes(n.id) ? n.x * 10 : undefined });
+  const vtk = F.exportVtk(mesh, { title: 'check', pointScalars: [{ name: 'u', values: s.values }], cellScalars: [{ name: 'area', values: s.elements.map(e => e.area) }] });
+  const lines = vtk.trim().split('\n');
+  assert.equal(lines[0], '# vtk DataFile Version 3.0'); assert.equal(lines[2], 'ASCII'); assert.equal(lines[3], 'DATASET UNSTRUCTURED_GRID');
+  assert.equal(lines[4], 'POINTS ' + mesh.nodes.length + ' float');
+  const ci = lines.findIndex(l => l.startsWith('CELLS ')), ti = lines.findIndex(l => l.startsWith('CELL_TYPES '));
+  assert.equal(lines[ci], 'CELLS ' + mesh.elements.length + ' ' + mesh.elements.length * 4);
+  lines.slice(ci + 1, ci + 1 + mesh.elements.length).forEach(l => assert.equal(l.split(' ').length, 4));
+  assert.equal(lines[ti], 'CELL_TYPES ' + mesh.elements.length);
+  for (let k = ti + 1; k < ti + 1 + mesh.elements.length; k++) assert.equal(lines[k], '5');
+  const pi = lines.findIndex(l => l.startsWith('POINT_DATA'));
+  assert.equal(lines[pi], 'POINT_DATA ' + mesh.nodes.length);
+  assert.equal(lines[pi + 1], 'SCALARS u float 1');
+  assert.ok(!/NaN|Infinity/.test(vtk));
+  assert.throws(() => F.exportVtk(mesh, { pointScalars: [{ name: 'bad name', values: s.values }] }), /single word/);
+  assert.throws(() => F.exportVtk(mesh, { pointScalars: [{ name: 'u', values: [1] }] }), /length mismatch/);
+  assert.throws(() => F.exportVtk({ nodes: mesh.nodes, elements: [{ nodes: [0, 1, 9999] }] }), /invalid node reference/);
+  assert.throws(() => F.exportVtk({ nodes: [], elements: [] }), /needs a mesh/);
+});
+
+test('triangulation terminates on clustered and near-collinear point sets', () => {
+  const pts = [];
+  for (let i = 0; i < 60; i++) pts.push([i * 0.1, (i % 3) * 1e-6 + (i % 7) * 0.01]);
+  pts.push([3, 2]); pts.push([0, 1.5]);
+  const mesh = F.triangulate(pts);
+  assert.ok(mesh.elements.length > 0);
+  assert.ok(Number.isFinite(mesh.quality.minimumAngle));
+  for (const e of mesh.elements) {
+    const [a, b, c] = e.nodes.map(id => mesh.nodes[id]);
+    assert.ok((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) > 0);
+  }
+});
+
+test('domain generation validates its spec', () => {
+  assert.throws(() => F.generateDomainMesh({ type: 'bogus' }), /unknown domain/);
+  assert.throws(() => F.generateDomainMesh({ type: 'annulus', nx: 1, ny: 20, width: 2, height: 2 }), /MeshLab:/);
+});
+

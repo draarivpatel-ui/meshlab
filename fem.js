@@ -788,8 +788,31 @@
     var ur;
     if (opt.method === 'pcg') {
       if (!Field) throw new Error('MeshLab: field tools are missing');
-      if (!solveLinear(Kr, zeros(n))) throw new Error('MeshLab: plate stiffness matrix is singular');
-      diagnostics = Field.solvePCG(Kr, Fr, opt);
+      /* A consistent singular system (zero load on a mechanism) still looks
+         converged to PCG, so probe the free rigid body modes first. */
+      var kScale = 0;
+      for (i = 0; i < n; i++) kScale = Math.max(kScale, Math.abs(Kr[i][i]));
+      var tx = zeros(n), ty = zeros(n), rot = zeros(n);
+      for (i = 0; i < n; i++) {
+        var nodeIndex = Math.floor(free[i] / 2);
+        if (free[i] % 2 === 0) { tx[i] = 1; rot[i] = -mesh.nodes[nodeIndex].y; }
+        else { ty[i] = 1; rot[i] = mesh.nodes[nodeIndex].x; }
+      }
+      [tx, ty, rot].forEach(function (v) {
+        var mv = matVec(Kr, v), energy = 0;
+        for (var q = 0; q < n; q++) energy += v[q] * mv[q];
+        if (Math.abs(energy) <= kScale * n * 1e-10) {
+          throw new Error('MeshLab: plate stiffness matrix is singular (mechanism or insufficient supports)');
+        }
+      });
+      try {
+        diagnostics = Field.solvePCG(Kr, Fr, opt);
+      } catch (pcgError) {
+        if (/non positive|mechanism/.test(pcgError.message)) {
+          throw new Error('MeshLab: plate stiffness matrix is singular (mechanism or insufficient supports)');
+        }
+        throw pcgError;
+      }
       if (!diagnostics.converged) throw new Error('MeshLab: plate PCG did not converge');
       ur = diagnostics.solution;
     } else ur = solveLinear(Kr, Fr);
@@ -1016,9 +1039,34 @@
 
   function heatFlow() {
     if (!Field) throw new Error('MeshLab: field tools are missing');
+    var spec = { type: 'rect', nx: 14, ny: 10, width: 2.4, height: 1.6 };
     return { name: 'Heat Flow on a Delaunay Mesh', dim: 2,
-      field: { mesh: Field.generateFieldMesh(14, 10, 2.4, 1.6), conductivity: 1,
+      field: { spec: spec, mesh: Field.generateFieldMesh(14, 10, 2.4, 1.6), conductivity: 1,
         heater: 1600, heaterRadius: 0.22, heaterX: 0.58, heaterY: 0.5, hotEdge: 100, coldEdge: 0 } };
+  }
+
+  function lBracketField() {
+    if (!Field) throw new Error('MeshLab: field tools are missing');
+    var spec = { type: 'l', nx: 20, ny: 16, width: 2, height: 2 };
+    return { name: 'L-Bracket Conduction', dim: 2,
+      field: { spec: spec, mesh: Field.generateDomainMesh(spec), conductivity: 1,
+        heater: 1200, heaterRadius: 0.16, heaterX: 0.28, heaterY: 0.72, hotEdge: 100, coldEdge: 0 } };
+  }
+
+  function annulusField() {
+    if (!Field) throw new Error('MeshLab: field tools are missing');
+    var spec = { type: 'annulus', nx: 24, ny: 20, width: 2, height: 2, ratio: 0.35 };
+    return { name: 'Annulus Conduction', dim: 2,
+      field: { spec: spec, mesh: Field.generateDomainMesh(spec), conductivity: 1,
+        hotEdge: 100, coldEdge: 0 } };
+  }
+
+  function heatSinkField() {
+    if (!Field) throw new Error('MeshLab: field tools are missing');
+    var spec = { type: 'sink', nx: 26, ny: 16, width: 2.4, height: 1.6, fins: 5 };
+    return { name: 'Heat Sink Fin Conduction', dim: 2,
+      field: { spec: spec, mesh: Field.generateDomainMesh(spec), conductivity: 1,
+        heater: 900, heaterRadius: 0.18, heaterX: 0.5, heaterY: 0.12, hotEdge: 80, coldEdge: 0 } };
   }
 
   var PRESET_BUILDERS = {
@@ -1028,7 +1076,10 @@
     tower: transmissionTower,
     dome: spaceTripodDome,
     plate: perforatedPlate,
-    heat: heatFlow
+    heat: heatFlow,
+    lbeam: lBracketField,
+    annulus: annulusField,
+    sink: heatSinkField
   };
 
   var PRESET_LIST = [
@@ -1038,7 +1089,10 @@
     { key: 'tower', name: 'Transmission Tower Lattice', dim: 2, kind: 'truss' },
     { key: 'dome', name: '3D Space Tripod Dome', dim: 3, kind: 'truss' },
     { key: 'plate', name: 'Perforated Plate in Tension (Kirsch Stress Concentration)', dim: 2, kind: 'plate' },
-    { key: 'heat', name: 'Heat Flow on a Delaunay Mesh', dim: 2, kind: 'field' }
+    { key: 'heat', name: 'Heat Flow on a Delaunay Mesh', dim: 2, kind: 'field' },
+    { key: 'lbeam', name: 'L-Bracket Conduction', dim: 2, kind: 'field' },
+    { key: 'annulus', name: 'Annulus Conduction', dim: 2, kind: 'field' },
+    { key: 'sink', name: 'Heat Sink Fin Conduction', dim: 2, kind: 'field' }
   ];
 
   function getPresets() { return PRESET_LIST.map(function (p) { return Object.assign({}, p); }); }
@@ -1261,6 +1315,8 @@
     triangulate: Field && Field.triangulate,
     solvePoisson: Field && Field.solvePoisson,
     generateFieldMesh: Field && Field.generateFieldMesh,
+    generateDomainMesh: Field && Field.generateDomainMesh,
+    exportVtk: Field && Field.exportVtk,
     planeStressD: planeStressD,
     stressMeasures: stressMeasures,
     getPresets: getPresets,

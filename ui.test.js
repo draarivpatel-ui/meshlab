@@ -11,7 +11,7 @@ test('actual static shell boots all three browser modules without reference erro
   assert.equal(app.$('preset-select').value, 'pratt');
   assert.equal(app.$('member-tbody').children.length, 34);
   assert.match(app.$('verification-summary').textContent, /VERIFIED/);
-  assert.equal(app.$('preset-select').getElementsByTagName('option').length, 7);
+  assert.equal(app.$('preset-select').getElementsByTagName('option').length, 10);
 });
 test('every structural preset and every supported result view runs against actual DOM bindings', () => {
   const app = boot();
@@ -178,5 +178,63 @@ test('zero-load plate rows generate valid finite background colors', () => {
     assert.ok(!style.includes('undefined') && !style.includes('NaN'), style);
     assert.match(style, /background:/);
   }
+});
+test('scalar domain presets render L bracket, annulus and heat sink with live verification', () => {
+  const app = boot();
+  for (const key of ['lbeam', 'annulus', 'sink']) {
+    app.input('preset-select', key, 'change');
+    assert.equal(app.$('solve-status').textContent, 'SOLVED', key);
+    assert.match(app.$('verification-summary').textContent, /VERIFIED/, key);
+    assert.ok(app.$('member-tbody').children.length > 0, key);
+    assert.ok(app.$('structure-svg').children.length > 0, key);
+    assert.ok(!app.$('stat-grid').textContent.includes('NaN'), key);
+  }
+});
+test('mesh resolution slider re-meshes the field and keeps the solve verified', () => {
+  const app = boot(); app.input('preset-select', 'annulus', 'change');
+  const before = app.$('member-tbody').children.length;
+  assert.equal(app.$('scale-label').textContent, 'MESH RESOLUTION');
+  app.input('scale-range', 2);
+  assert.equal(app.$('scale-output').textContent, '2x');
+  assert.ok(app.$('member-tbody').children.length > before, 'refined mesh has more triangles');
+  assert.match(app.$('verification-summary').textContent, /VERIFIED/);
+  app.input('scale-range', 0.5); assert.match(app.$('verification-summary').textContent, /VERIFIED/);
+});
+test('vtk export writes a structurally valid unstructured grid for field, plate and truss', async () => {
+  const app = boot(), buttons = [...app.document.getElementsByClassName('dl-btn')];
+  const vtkBtn = buttons.find(b => b.getAttribute('data-export') === 'vtk');
+  assert.ok(vtkBtn, 'vtk button exists');
+  for (const [key, minNodes] of [['heat', 165], ['plate', 50], ['pratt', 16]]) {
+    app.input('preset-select', key, 'change'); vtkBtn.click();
+    const text = await app.downloads[app.downloads.length - 1].blob.text();
+    const lines = text.trim().split('\n');
+    assert.equal(lines[0], '# vtk DataFile Version 3.0', key);
+    assert.equal(lines[2], 'ASCII'); assert.equal(lines[3], 'DATASET UNSTRUCTURED_GRID');
+    assert.match(lines[4], /^POINTS \d+ float$/);
+    const n = Number(lines[4].split(' ')[1]); assert.ok(n >= minNodes, key + ' nodes');
+    const ci = lines.findIndex(l => l.startsWith('CELLS ')), ti = lines.findIndex(l => l.startsWith('CELL_TYPES ')), pi = lines.findIndex(l => l.startsWith('POINT_DATA '));
+    assert.ok(ci > 5 && ti > ci && pi > ti, key + ' section order');
+    const m = Number(lines[ci].split(' ')[1]);
+    const cellInts = lines.slice(ci + 1, ci + 1 + m).reduce((sum, l) => sum + Number(l.split(' ')[0]) + 1, 0);
+    assert.equal(cellInts, Number(lines[ci].split(' ')[2]), key + ' cell integer count');
+    assert.equal(pi - ti - 1, m, key + ' cell type count');
+    assert.equal(Number(lines[pi].split(' ')[1]), n, key + ' point data count');
+    assert.ok(!/NaN|Infinity/.test(text), key + ' finite values');
+  }
+});
+test('switching presets clears the showcase pressed state', () => {
+  const app = boot(), buttons = app.document.getElementsByClassName('scenario-btn');
+  buttons[0].click(); assert.equal(buttons[0].getAttribute('aria-pressed'), 'true');
+  app.input('preset-select', 'heat', 'change');
+  assert.equal(buttons[0].getAttribute('aria-pressed'), 'false');
+});
+test('field nodes expose exact position, temperature and flux on pointer inspection', () => {
+  const app = boot(); app.input('preset-select', 'heat', 'change');
+  const dot = app.$('structure-svg').getElementsByClassName('svg-field-node')[0];
+  assert.ok(dot, 'node dots rendered');
+  dot.dispatch('pointerenter', { clientX: 100, clientY: 100 });
+  assert.equal(app.$('tooltip').getAttribute('hidden'), null);
+  assert.match(app.$('tooltip').textContent, /Temperature/); assert.match(app.$('tooltip').textContent, /flux/);
+  assert.match(app.$('inspector').textContent, /FIELD NODE/);
 });
 

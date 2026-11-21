@@ -15,7 +15,7 @@ No package installation, external assets, build step, service, or runtime depend
 | Trace a bridge | Blue tension, red compression, support reactions | 360 kN total vertical load; 7.1582 mm peak translation |
 | Overload a crane | Dashed critical member, deformed outline, yield safety | At 5x load, Upper boom 1 governs with yield FoS 0.861538; one critical member |
 | Stress around a hole | Individual CST stress tensors and the cavity boundary | 72.9961 MPa peak von Mises; peak/nominal ratio 2.919845 |
-| Follow the heat | Interior heater, temperature, constant triangle heat flux | 165 nodes and 280 Delaunay triangles; 145.9927 C peak temperature |
+| Follow the heat | Interior heater, temperature, constant triangle heat flux | 165 nodes and 280 Delaunay triangles; 144.7337 C peak temperature |
 
 Move the load or heater slider to compare scenarios. Hover any member or triangle for live measurements, select it to pin those measurements, then use **Run round-trip check** to serialize and reproduce the model. The plate check compares sparse PCG against independent Gaussian elimination.
 
@@ -31,10 +31,11 @@ Move the load or heater slider to compare scenarios. Hover any member or triangl
 
 ### Scalar field analysis
 
-- **Delaunay meshing:** deterministic convex-hull sweep and Lawson edge-flip triangulation with normalized geometry, duplicate point removal, hull extraction, positive triangle winding and minimum angle reporting.
-- **Poisson FEM:** linear scalar triangles solve `-div(k grad T) = q`. Nonzero prescribed boundary values enter the reduced right hand side correctly; unconstrained edges have the natural zero flux condition.
-- **Sparse PCG:** compressed sparse row multiplication, Jacobi preconditioning, symmetry and positive curvature checks, finite iteration limits, and a recomputed actual residual before reporting convergence.
-- **Heat flow:** prescribed 100 C and 0 C edges, insulated top and bottom, and an adjustable interior Gaussian heater. Flux is `-k grad T` and heat balance is reported per unit depth.
+- **Delaunay meshing:** deterministic convex-hull sweep and Lawson edge-flip triangulation with normalized geometry, duplicate point removal, hull extraction, positive triangle winding, sliver cleanup and minimum angle / radius-edge / Euler characteristic reporting.
+- **Non-convex and holed domains:** rectangle, L-bracket, annulus with a real hole (Euler V-E+F = 0) and a finned heat sink. Polygon and hole clipping keeps the boundary Delaunay valid; boundary sets mark hot and cold edges for each domain.
+- **Poisson FEM:** linear scalar triangles solve `-div(k grad T) = q`. Function sources integrate on a three point edge midpoint rule (exact for quadratics, tighter than a centroid sample for the Gaussian heater). Nonzero prescribed boundary values enter the reduced right hand side correctly; unconstrained edges have the natural zero flux condition.
+- **Sparse PCG:** compressed sparse row multiplication, Jacobi preconditioning, symmetry and positive curvature checks, finite iteration limits, a recomputed actual residual before reporting convergence, and a residual history the app plots as a log scale sparkline.
+- **Heat flow:** prescribed hot and cold boundary sets with insulated free edges and an adjustable interior Gaussian heater. Flux is `-k grad T`, rendered as arrows whose length encodes local magnitude; heat balance is reported per unit depth and every node exposes exact `(x, y, T, |grad T|)` on hover.
 
 All structural engine quantities use SI units: m, N, Pa, kg, Hz and J. Display values use mm, kN and MPa. The heat experiment uses C, W/m2 and W/m per unit depth.
 
@@ -49,6 +50,9 @@ All structural engine quantities use SI units: m, N, Pa, kg, Hz and J. Display v
 | `dome` | 3D Space Tripod Dome with isometric projection | 3D truss |
 | `plate` | Perforated plate, 336 nodes, 580 triangles | CST plane stress |
 | `heat` | Irregular mesh, 165 nodes, 280 triangles | Delaunay Poisson FEM |
+| `lbeam` | L-bracket non-convex domain, 285 nodes, 488 triangles | Delaunay Poisson FEM |
+| `annulus` | Annulus with a real hole, 461 nodes, 818 triangles | Delaunay Poisson FEM |
+| `sink` | Finned heat sink domain, 206 nodes, 303 triangles | Delaunay Poisson FEM |
 
 The force count in `m + r - dj` is reported alongside the solved stiffness system. A nonnegative count alone is not a proof of stability. Singular direct systems raise a descriptive error.
 
@@ -58,7 +62,7 @@ The force count in `m + r - dj` is reported alongside the solved stiffness syste
 node --test --test-reporter=spec test.js numerics.test.js ui.test.js
 ```
 
-**168 tests passed, 0 failed, 0 skipped.** The suites contain 102 structural/export checks, 42 numerical and edge case checks, and 24 DOM/interface checks. All test code uses built in Node modules.
+**182 tests passed, 0 failed, 0 skipped.** The suites contain 102 structural/export checks, 51 numerical and edge case checks, and 29 DOM/interface checks. All test code uses built in Node modules.
 
 | Reproduced check | Verified value |
 | --- | --- |
@@ -66,11 +70,14 @@ node --test --test-reporter=spec test.js numerics.test.js ui.test.js
 | Holed plate PCG convergence | 285 iterations; relative residual below 1e-12 |
 | Delaunay mesh area | 3.84 m2 |
 | Delaunay minimum angle | 33.6772 degrees |
-| Harmonic field `T = 100(1 - x / width)` | Maximum nodal error below 4e-10 C on the default irregular mesh |
+| Harmonic field `T = 100(1 - x / width)` | Maximum nodal error 3.15e-10 C on the default irregular mesh |
+| Annulus radial field `T(r)` | Maximum nodal error 9.91e-2 C against `100 ln(r/Rout)/ln(Rin/Rout)` |
+| Manufactured solution `sin(pi x) sin(pi y)` | Second order L2 convergence, measured order near 2.0 |
+| Domain Euler characteristic | Rectangle / L / sink V-E+F = 1; annulus V-E+F = 0 (one hole) |
 | Consistent mass bridge modes | Full generalized eigen residual below 1e-8; mutual mass orthogonality checked |
 | Primary, secondary and status text in both themes | Automated contrast checks require at least 4.5:1 against the panel background |
 
-DOM tests load the actual HTML and all browser scripts into a browser contract fixture. They exercise all seven presets, controls, numeric SVG attributes, mode animation, keyboard inspection, download generation, error recovery and round-trip checks. They verify bindings and behavior; browser layout and screen rendering are separate from this fixture.
+DOM tests load the actual HTML and all browser scripts into a browser contract fixture. They exercise all ten presets, controls, numeric SVG attributes, mode animation, keyboard inspection, download generation, error recovery and round-trip checks. They verify bindings and behavior; browser layout and screen rendering are separate from this fixture.
 
 Syntax can be checked without running the app:
 
@@ -105,6 +112,7 @@ All seven scripts pass syntax checks.
 | `.INP` | CalculiX / Abaqus style truss input deck | `CPS3` plate deck with the actual constrained DOFs and one consolidated load per DOF | Unavailable |
 | `.SVG` | Standalone deformed result, including projected z coordinates | Standalone deformed von Mises contour | Standalone temperature contour |
 | `.JSON` | Reactions, member results, safety, modes and verification | Nodal results, stress tensors, forces, constraints and PCG diagnostics | Mesh, temperatures, flux, balance and PCG diagnostics |
+| `.VTK` | Legacy ASCII `UNSTRUCTURED_GRID` lines with displacement vectors and axial force/stress per member | Unstructured grid with nodal displacement and von Mises scalars | Unstructured grid with temperature, nodal and element heat flux |
 
 Downloads are generated locally. Object URLs are released after downloading.
 
@@ -125,7 +133,7 @@ console.log(result.maxDisplacement, result.verification);
 
 The structural models are linear elastic axial trusses and plane stress CST plates. They do not include beam bending, plastic redistribution, contact or large deformation. Euler buckling and yield ratios are screening calculations within those assumptions. Mode display amplitude is an inspection setting, not a prediction of forced vibration amplitude.
 
-The perforated plate has finite width and a stair step approximation of the hole. Its measured concentration is compared with nominal membrane stress; it is not claimed as an exact solution for an infinite circular-hole plate. The Delaunay field mesh covers a convex rectangular domain and the Poisson source is integrated by triangle centroid quadrature.
+The perforated plate has finite width and a stair step approximation of the hole. Its measured concentration is compared with nominal membrane stress; it is not claimed as an exact solution for an infinite circular-hole plate. Delaunay field meshes cover rectangular, L-shaped, annular and finned domains; holed domains are discretized by polygon clipping, so the annulus inner radius is a polygonal approximation of the circle. Scalar function sources integrate on a three point edge midpoint rule per triangle.
 
 ## Files
 
