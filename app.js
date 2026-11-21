@@ -777,12 +777,20 @@
     appendRow(tb, 'Residual Y', signed(e.residualY / 1000, 6) + ' kN');
     if (state.kind !== 'plate') {
       appendRow(tb, 'Residual Z', signed((e.residualZ || 0) / 1000, 6) + ' kN');
+      if (state.solution.dim === 3) {
+        appendRow(tb, 'Residual Mx', signed(e.residualMx / 1000, 6) + ' kN m');
+        appendRow(tb, 'Residual My', signed(e.residualMy / 1000, 6) + ' kN m');
+      }
+      appendRow(tb, 'Residual Mz', signed(e.residualMz / 1000, 6) + ' kN m');
       appendRow(tb, 'External work', fixed(state.solution.externalWork, 6) + ' J');
+    } else {
+      appendRow(tb, 'Residual M', signed(e.residualM / 1000, 6) + ' kN m');
     }
     var res = Math.max(Math.abs(e.residualX || 0), Math.abs(e.residualY || 0), Math.abs(e.residualZ || 0));
+    var balanced = res < 1e-3 && (e.relativeMomentResidual === undefined || e.relativeMomentResidual < 1e-8);
     var badge = $('equilibrium-badge');
-    badge.textContent = res < 1e-3 ? 'BALANCED' : 'CHECK';
-    badge.setAttribute('data-state', res < 1e-3 ? 'good' : 'critical');
+    badge.textContent = balanced ? 'BALANCED' : 'CHECK';
+    badge.setAttribute('data-state', balanced ? 'good' : 'critical');
   }
 
   function renderDeterminacy() {
@@ -963,7 +971,7 @@
 
   function renderModeScrub() {
     var scrub = $('mode-scrub');
-    var show = state.view === 'modes' && state.kind !== 'plate';
+    var show = state.view === 'modes' && state.kind !== 'plate' && !!state.modes;
     if (!show) {
       scrub.setAttribute('hidden', '');
       stopAnimation();
@@ -1259,6 +1267,28 @@
     return out.join('\n') + '\n';
   }
 
+  function plateCsv() {
+    var p = state.plate;
+    return M.toCsv(['element_id', 'node_a', 'node_b', 'node_c', 'area_m2',
+      'centroid_x_m', 'centroid_y_m', 'sigmaX_Pa', 'sigmaY_Pa', 'tauXY_Pa',
+      'sigma1_Pa', 'sigma2_Pa', 'tauMax_Pa', 'vonMises_Pa', 'strainEnergy_J'],
+      p.elements.map(function (e) {
+        return [e.id + 1, e.nodes[0] + 1, e.nodes[1] + 1, e.nodes[2] + 1, e.area,
+          e.centroid.x, e.centroid.y, e.stress.sigmaX, e.stress.sigmaY,
+          e.stress.tauXY, e.sigma1, e.sigma2, e.tauMax, e.vonMises, e.strainEnergy];
+      }));
+  }
+
+  function fieldCsv() {
+    var f = state.field;
+    return M.toCsv(['triangle_id', 'node_a', 'node_b', 'node_c', 'area_m2',
+      'centroid_x_m', 'centroid_y_m', 'temperature_C', 'fluxX_W_m2', 'fluxY_W_m2', 'energy_J'],
+      f.elements.map(function (e) {
+        return [e.id + 1, e.nodes[0] + 1, e.nodes[1] + 1, e.nodes[2] + 1, e.area,
+          e.centroid.x, e.centroid.y, e.value, e.fluxX, e.fluxY, e.energy];
+      }));
+  }
+
   function plateJsonExport() {
     var p = state.plate;
     var report = {
@@ -1285,6 +1315,9 @@
           vonMises: e.vonMises, strainEnergy: e.strainEnergy };
       })
     };
+    report.integrity = { algorithm: 'SHA-256',
+      scope: 'compact JSON of this report without the integrity object',
+      hash: M.sha256(JSON.stringify(report)) };
     return JSON.stringify(report, null, 2) + '\n';
   }
 
@@ -1320,11 +1353,23 @@
       return;
     }
     if (state.kind === 'field') {
-      if (kind === 'json') download(base + '.json', JSON.stringify({ format: 'MeshLab Poisson report v2.0.0',
-        units: { length: 'm', temperature: 'C', flux: 'W/m2' }, model: state.model, mesh: state.field.mesh, values: state.field.values,
-        elements: state.field.elements, verification: state.field.verification,
-        diagnostics: { method: state.field.diagnostics.method, iterations: state.field.diagnostics.iterations, relativeResidual: state.field.diagnostics.relativeResidual } }, null, 2) + '\n', 'application/json');
+      if (kind === 'json') {
+        var frep = { format: 'MeshLab Poisson report v2.0.0',
+          units: { length: 'm', temperature: 'C', flux: 'W/m2' }, model: state.model, mesh: state.field.mesh, values: state.field.values,
+          elements: state.field.elements, verification: state.field.verification,
+          diagnostics: { method: state.field.diagnostics.method, iterations: state.field.diagnostics.iterations, relativeResidual: state.field.diagnostics.relativeResidual } };
+        frep.integrity = { algorithm: 'SHA-256',
+          scope: 'compact JSON of this report without the integrity object',
+          hash: M.sha256(JSON.stringify(frep)) };
+        download(base + '.json', JSON.stringify(frep, null, 2) + '\n', 'application/json');
+      }
       else if (kind === 'svg') download(base + '.svg', fieldSvgExport(), 'image/svg+xml');
+      else if (kind === 'csv') download(base + '.csv', fieldCsv(), 'text/csv');
+      return;
+    }
+    if (kind === 'csv') {
+      var csv = state.kind === 'plate' ? plateCsv() : M.exportMembersCsv(state.solution, state.safety);
+      download(base + '.csv', csv, 'text/csv');
       return;
     }
     if (kind === 'inp') {

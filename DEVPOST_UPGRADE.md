@@ -28,11 +28,15 @@ The thermal experiment creates a deterministic irregular mesh with normalized sw
 
 An audit found that preset loads were present both on nodes and in a top level load array, doubling the physical load. That error could survive equilibrium checks because the doubled model still balanced. Presets now have one load declaration and dedicated tests compare solved totals with the intended inputs.
 
+A second audit found a fail-open boundary condition path: a `fixedNodes` entry for node id 0 fell through a falsy value guard, so a pin on the first mesh node was silently discarded while the solver correctly reported the resulting mechanism as singular. The same guard shape could drop a scalar nodal load on node 0. Both paths now only skip absent lists, and a regression test pins node 0 explicitly. The same audit replaced edge traction normalized by full plate height with normalization by the actually covered boundary span, so a partial edge list applies exactly its declared total force.
+
 Consistent mass was another subtle issue: treating its diagonal as the complete mass matrix gave positive frequencies while failing the coupled generalized eigenproblem. Full Cholesky reduction and independent residual and mass orthogonality checks now cover the coupled case.
 
 The interface also needed honest data binding. Live select values had been updated through attributes, the force width encoding was overridden by CSS, modal amplitudes were almost invisible, and repeated selector rebuilding could disrupt focus. Controls now use live properties, force widths retain their data encoding, modal amplitudes are visible and independent of static load, and the animation has a single time based loop with stable bounds.
 
 Additional repairs cover short load arrays, invalid materials and node references, plate load arrays, degenerate and orphaned mesh geometry, 3D SVG projection, consolidated export loads, zero load states, tooltip placement and download URL cleanup.
+
+A hostile adversarial review then probed every input path. The worst finding was a silent wrong answer: a fractional node reference such as `2.5` passed the range check and redirected degree of freedom indexing, corrupting constraints and loads while verification still reported a pass. Every plate boundary condition and load path now requires integer node ids inside the mesh and fails closed. The same review hardened scalar truss load vectors, edge traction lists with fewer than two boundary nodes, nonzero prescribed displacements, non-array option containers, sub-micron plate sliver tolerances and stress measure overflow.
 
 ## Accomplishments
 
@@ -44,6 +48,9 @@ Additional repairs cover short load arrays, invalid materials and node reference
 - Keyboard inspection uses a single diagram entry point with arrow navigation and persistent pinned measurements.
 - Responsive SVG, screen-width member hit targets, explicit text states, reduced motion behavior and both theme palettes are implemented together.
 - Input decks, standalone SVG and complete numerical JSON reports are generated locally.
+- Every solve balances forces and moments about the origin; residuals are shown for 2D, 3D and plate models.
+- JSON reports embed a SHA-256 integrity hash, and formula-safe CSV exports protect spreadsheet users.
+- A restrictive Content-Security-Policy confines scripts to same-directory code and blocks all other resource types; only style attributes keep a narrow inline allowance for data-driven rendering.
 
 ## Verification numbers
 
@@ -53,7 +60,7 @@ Reproduced with:
 node --test --test-reporter=spec test.js numerics.test.js ui.test.js
 ```
 
-The run passes **185 tests with 0 failures, 0 skipped and 0 cancelled**: 102 structural/export checks, 51 numerical edge case checks and 32 DOM/interface checks. All seven JavaScript source and test files also pass `node --check`.
+The run passes **218 tests with 0 failures, 0 skipped and 0 cancelled**: 102 structural/export checks, 78 numerical edge case checks and 38 DOM/interface checks. All seven JavaScript source and test files also pass `node --check`.
 
 | Measurement | Reproduced value |
 | --- | --- |
@@ -71,6 +78,8 @@ The run passes **185 tests with 0 failures, 0 skipped and 0 cancelled**: 102 str
 | Domain Euler characteristic | Rectangle / L / sink V-E+F = 1; annulus V-E+F = 0 (one hole) |
 | Manufactured solution `sin(pi x) sin(pi y)` | Second order L2 convergence, measured order near 2.0 |
 | Consistent mass bridge mode checks | Relative generalized eigen residual below 1e-8 and mutual mass orthogonality |
+| Global moment residual | Below 1e-10 relative on every truss preset and the CST plate |
+| JSON integrity hash | Compact report reserializes to the embedded SHA-256 value on every engine |
 | Theme text contrast | Primary, secondary and status text meet automated 4.5:1 panel-background checks in both themes |
 
 DOM verification loads the actual HTML and all browser scripts into a browser contract fixture. It exercises every preset and supported view, all sliders and overlays, keyboard inspection, mode animation, downloads, errors and round-trip checks. The fixture verifies behavior and bindings; it does not measure browser layout or screen rendering.

@@ -383,3 +383,302 @@ test('domain generation validates its spec', () => {
   assert.throws(() => F.generateDomainMesh({ type: 'annulus', nx: 1, ny: 20, width: 2, height: 2 }), /MeshLab:/);
 });
 
+/* ------------------------------------------------------------------ */
+/* Moment equilibrium, SHA-256 integrity, CSV exports, determinism     */
+/* ------------------------------------------------------------------ */
+
+test('every truss preset balances moments about the origin', () => {
+  for (const key of ['pratt', 'warren', 'crane', 'tower', 'dome']) {
+    const s = M.solveTruss(M.getPreset(key));
+    assert.ok(Math.abs(s.equilibrium.residualMz) < 1e-4, key + ' Mz residual ' + s.equilibrium.residualMz);
+    assert.ok(s.equilibrium.relativeMomentResidual < 1e-10, key + ' relative moment residual');
+    if (s.dim === 3) {
+      assert.ok(Math.abs(s.equilibrium.residualMx) < 1e-4, key + ' Mx');
+      assert.ok(Math.abs(s.equilibrium.residualMy) < 1e-4, key + ' My');
+    }
+  }
+});
+
+test('load and reaction moment sums decompose the balance', () => {
+  const s = M.solveTruss(M.getPreset('crane'));
+  let loadM = 0, reactM = 0;
+  s.nodes.forEach((n) => {
+    loadM += n.x * n.load[1] - n.y * n.load[0];
+    reactM += n.x * n.reaction[1] - n.y * n.reaction[0];
+  });
+  close(s.equilibrium.sumMz, loadM, 1e-9);
+  close(s.equilibrium.sumRMz, reactM, 1e-9);
+  close(s.equilibrium.residualMz, loadM + reactM, 1e-9);
+});
+
+test('the CST plate balances moments about the origin', () => {
+  const s = M.solvePlateCST(patch(), {}, {}, { rightNodesForce: 120000 });
+  assert.ok(Math.abs(s.equilibrium.residualM) < 1e-4);
+  assert.ok(s.equilibrium.relativeMomentResidual < 1e-10);
+  assert.ok(Math.abs(s.equilibrium.momentResidual) < 1e-4);
+});
+
+test('edge traction applies its declared total even on partial edge coverage', () => {
+  const mesh = M.generatePlateMesh(4, 4, 2, 1, 0);
+  /* Keep only the bottom half of the right edge so coverage != mesh.height. */
+  const partial = mesh.rightNodes.filter((id) => mesh.nodes[id].y <= 0.5);
+  mesh.rightNodes = partial;
+  const s = M.solvePlateCST(mesh, {}, { left: 'rollerX', fixedNodes: [mesh.grid[0][0]] },
+    { rightNodesForce: 7000 });
+  close(s.equilibrium.sumFx, 7000, 1e-9);
+});
+
+test('fixedNodes honors node id 0 instead of silently dropping the pin', () => {
+  const mesh = patch();
+  /* Node 0 is the bottom left corner. Before the fix, a falsy id fell through
+     the list guard and the rigid body translation stayed free. */
+  const s = M.solvePlateCST(mesh, {}, { left: 'rollerX', fixedNodes: [0] },
+    { rightNodesForce: 7000 });
+  assert.equal(s.nodes[0].ux, 0);
+  assert.equal(s.nodes[0].uy, 0);
+  assert.ok(Math.abs(s.nodes[0].ry) > 0 || Math.abs(s.reactions[1]) > 0, 'node 0 carries a reaction');
+  assert.ok(Math.abs(s.equilibrium.residualM) < 1e-4);
+});
+
+test('sha256 matches the Node crypto implementation on edge cases', () => {
+  const crypto = require('crypto');
+  const cases = ['', 'a', 'abc', 'x'.repeat(55), 'y'.repeat(56), 'z'.repeat(64),
+    'block boundary '.repeat(20), 'uni é÷▓ snow ☃', 'line\nbreaks\ttabs'];
+  for (const s of cases) {
+    assert.equal(M.sha256(s), crypto.createHash('sha256').update(s, 'utf8').digest('hex'), 'sha256 ' + JSON.stringify(s.slice(0, 20)));
+  }
+});
+
+test('report JSON integrity hash verifies after removing the integrity block', () => {
+  const crypto = require('crypto');
+  for (const key of ['pratt', 'crane', 'dome']) {
+    const rep = JSON.parse(M.exportReportJson(M.getPreset(key)));
+    assert.equal(rep.integrity.algorithm, 'SHA-256');
+    assert.match(rep.integrity.hash, /^[0-9a-f]{64}$/);
+    const hash = rep.integrity.hash;
+    delete rep.integrity;
+    assert.equal(crypto.createHash('sha256').update(JSON.stringify(rep), 'utf8').digest('hex'), hash, key);
+  }
+});
+
+test('every exporter is byte deterministic across fresh solves', () => {
+  const a = M.getPreset('tower'), b = M.getPreset('tower');
+  assert.equal(M.exportCalculiXInp(a), M.exportCalculiXInp(b));
+  assert.equal(M.exportReportJson(a), M.exportReportJson(b));
+  assert.equal(M.exportDeformedSvg(a, null, 120), M.exportDeformedSvg(b, null, 120));
+  assert.equal(M.exportMembersCsv(M.solveTruss(a)), M.exportMembersCsv(M.solveTruss(b)));
+  const m1 = F.generateFieldMesh(8, 6, 2, 1), m2 = F.generateFieldMesh(8, 6, 2, 1);
+  assert.deepEqual(m1.elements, m2.elements);
+  const s1 = F.solvePoisson(m1, { boundary: (n, i) => m1.boundaryNodes.includes(i) ? n.x : undefined });
+  const s2 = F.solvePoisson(m2, { boundary: (n, i) => m2.boundaryNodes.includes(i) ? n.x : undefined });
+  assert.deepEqual(s1.values, s2.values);
+});
+
+test('member CSV carries headers, member rows and CRLF line endings', () => {
+  const s = M.solveTruss(M.getPreset('pratt'));
+  const csv = M.exportMembersCsv(s);
+  const lines = csv.trimEnd().split('\r\n');
+  assert.equal(lines[0].split(',')[0], 'member_id');
+  assert.equal(lines.length, s.members.length + 1);
+  assert.match(lines[1], /^1,Bottom 1,/);
+  assert.ok(csv.endsWith('\r\n'));
+  /* numeric fields are machine readable */
+  const axial = Number(lines[1].split(',')[5]);
+  assert.ok(Math.abs(axial - s.members[0].axialForce) < 1e-6 * Math.abs(s.members[0].axialForce || 1));
+});
+
+test('CSV escapes spreadsheet formula injection and separators', () => {
+  const model = {
+    dim: 2, nodes: [{ x: 0, y: 0, support: 'pin' }, { x: 2, y: 0, support: 'rollerY', load: [1000, 0] }],
+    members: [{ a: 0, b: 1, label: '=1+cmd|evil', E: 2e11, A: 0.01, I: 1e-6 }]
+  };
+  const csv = M.exportMembersCsv(M.solveTruss(model));
+  assert.ok(csv.includes("'=1+cmd|evil"), 'formula label escaped');
+  assert.ok(!/\r\n\d,=1/.test(csv), 'no raw formula cell');
+  for (const evil of ['+2*3', '-9-9', '@SUM(1)', '\t=x()']) {
+    assert.equal(M.csvEscape(evil), "'" + evil);
+  }
+  /* embedded separators additionally get RFC 4180 quoting */
+  assert.equal(M.csvEscape('\rcalc'), '"\'\rcalc"');
+  assert.equal(M.csvEscape('a,b'), '"a,b"');
+  assert.equal(M.csvEscape('say "hi"'), '"say ""hi"""');
+  assert.equal(M.csvEscape(-42.5), '-42.5');
+  assert.equal(M.csvEscape(Infinity), 'Infinity');
+  assert.equal(M.csvEscape('-Infinity'), "'-Infinity");
+  assert.throws(() => M.toCsv(['a'], [[1, 2]]), /header/);
+});
+
+test('under-constrained trusses fail closed instead of returning mechanisms', () => {
+  const unsupported = {
+    dim: 2, nodes: [{ x: 0, y: 0 }, { x: 1, y: 0, load: [10, 0] }],
+    members: [{ a: 0, b: 1 }]
+  };
+  assert.throws(() => M.solveTruss(unsupported), /singular/);
+  const floatNode = {
+    dim: 2, nodes: [{ x: 0, y: 0, support: 'pin' }, { x: 1, y: 0, support: 'pin' }, { x: 0.5, y: 1 }],
+    members: [{ a: 0, b: 1 }]
+  };
+  assert.throws(() => M.solveTruss(floatNode), /singular/);
+  const rollerOnly = {
+    dim: 2, nodes: [{ x: 0, y: 0, support: 'rollerY' }, { x: 1, y: 0, support: 'rollerY', load: [5, 0] }],
+    members: [{ a: 0, b: 1 }]
+  };
+  assert.throws(() => M.solveTruss(rollerOnly), /singular/);
+});
+
+test('a member joining a node to itself raises the zero length error', () => {
+  assert.throws(() => M.solveTruss({
+    dim: 2, nodes: [{ x: 0, y: 0, support: 'pin' }, { x: 1, y: 0 }],
+    members: [{ a: 0, b: 0 }]
+  }), /zero length/);
+});
+
+test('loads applied at fixed DOFs are absorbed into the reactions', () => {
+  const model = {
+    dim: 2, material: { E: 2e11 },
+    nodes: [{ x: 0, y: 0, support: 'pin', load: [4000, 0] }, { x: 2, y: 0, support: 'rollerY', load: [4000, 0] }],
+    members: [{ a: 0, b: 1, E: 2e11, A: 0.01, I: 1e-6 }]
+  };
+  const s = M.solveTruss(model);
+  /* both 4 kN loads flow into the single x restraint at node 0 */
+  close(s.reactions[0], -8000, 1e-6);
+  close(s.nodes[1].displacement[0], 4000 * 2 / (2e11 * 0.01), 1e-12);
+  close(s.equilibrium.residualX, 0, 1e-6);
+  assert.ok(s.equilibrium.relativeMomentResidual < 1e-10);
+});
+
+test('Poisson rejects an unanchored disconnected component', () => {
+  const mesh = {
+    nodes: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: 5, y: 0 }, { x: 6, y: 0 }, { x: 5, y: 1 }],
+    elements: [{ nodes: [0, 1, 2] }, { nodes: [3, 4, 5] }]
+  };
+  assert.throws(() => F.solvePoisson(mesh, { boundary: (n, i) => i < 3 ? 10 : undefined }), /every mesh component/);
+  const ok = F.solvePoisson(mesh, { boundary: (n, i) => i < 3 ? 10 : (i === 3 ? 4 : undefined) });
+  ok.values.forEach((v, i) => close(v, i < 3 ? 10 : 4, 1e-9));
+});
+
+test('the cantilever crane reaction moment balances the applied tip moment', () => {
+  const model = M.getPreset('crane');
+  const s = M.solveTruss(model);
+  /* Tip load total is vertical at x = 12.5; the built-in base supplies the
+     counter moment through its reaction pair. */
+  assert.ok(Math.abs(s.equilibrium.sumMz) > 1e6, 'applied moment exists');
+  close(s.equilibrium.residualMz, 0, 1e-6);
+  assert.ok(s.equilibrium.relativeMomentResidual < 1e-10);
+});
+
+/* ------------------------------------------------------------------ */
+/* Adversarial audit regression tests                                  */
+/* ------------------------------------------------------------------ */
+
+test('sha256 encodes lone surrogates as U+FFFD like the WHATWG encoder', () => {
+  const crypto = require('crypto');
+  for (const s of ['\uD800', '\uDC00', 'a\uD800b', '\uD800\uD800', 'end\uDC00', '\uD83D\uDE00']) {
+    assert.equal(M.sha256(s), crypto.createHash('sha256').update(s, 'utf8').digest('hex'), JSON.stringify(s));
+  }
+});
+
+test('CSV escapes formula triggers after leading whitespace', () => {
+  for (const evil of [' =1+1', '  -2+3', ' @SUM(1)', ' \t=x()', '\v=2', '\f+9']) {
+    assert.equal(M.csvEscape(evil), "'" + evil);
+  }
+  assert.equal(M.csvEscape('  plain'), '  plain');
+  assert.equal(M.csvEscape('  42'), '  42');
+});
+
+test('VTK export defaults only the missing third vector component', () => {
+  const mesh = F.generateFieldMesh(3, 2, 1, 1);
+  const deck = F.exportVtk(mesh, { title: 't',
+    pointVectors: [{ name: 'u', values: mesh.nodes.map(() => [1, 2]) }] });
+  assert.ok(deck.includes('1 2 0'), 'two component vector exports z 0');
+  const deck2 = F.exportVtk(mesh, { title: 't',
+    pointVectors: [{ name: 'u', values: mesh.nodes.map(() => ({ x: 1, y: 2 })) }] });
+  assert.ok(deck2.includes('1 2 0'), 'object vector exports z 0');
+  assert.throws(() => F.exportVtk(mesh, { title: 't',
+    pointVectors: [{ name: 'u', values: mesh.nodes.map(() => ({ x: 1, y: 2, z: NaN })) }] }), /finite/);
+  assert.throws(() => F.exportVtk({ nodes: [{ x: 0, y: 0, z: NaN }, { x: 1, y: 0 }, { x: 0, y: 1 }],
+    elements: [{ nodes: [0, 1, 2] }] }, {}), /finite/);
+});
+
+test('INP export coerces a non-string model name instead of crashing', () => {
+  const model = M.getPreset('pratt');
+  model.name = 42;
+  const deck = M.exportCalculiXInp(model);
+  assert.ok(deck.length > 100);
+  const named = { nodes: model.nodes, members: model.members, dim: 2, name: { evil: true } };
+  assert.ok(M.exportCalculiXInp(named).length > 0);
+});
+
+test('extreme INP values keep ten significant digits', () => {
+  const model = {
+    dim: 2, name: 'big',
+    nodes: [{ x: 0, y: 0, support: 'pin' }, { x: 123456789.123, y: 0, support: 'rollerY', load: [1000, 0] }],
+    members: [{ a: 0, b: 1, E: 2e11, A: 0.01, I: 1e-6 }]
+  };
+  const deck = M.exportCalculiXInp(model);
+  assert.ok(deck.includes('1.234567891'), 'full precision coordinate, got: ' + deck.match(/1\.23456[0-9e+]*/));
+});
+
+test('fractional and string node ids in plate BCs and loads fail closed', () => {
+  const mesh = patch();
+  const loads = { nodal: [{ node: 2.5, fx: 100 }] };
+  assert.throws(() => M.solvePlateCST(mesh, {}, { left: 'fixed' }, loads), /integer/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { left: 'fixed', fixedNodes: [0, 2.5] }, {}), /integer/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { left: 'fixed', fixedNodes: ['2'] }, {}), /integer/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { constraints: [{ node: 1.5, x: true }] }, {}), /integer/);
+  const frac = patch(); frac.rightNodes = [1.5, 4];
+  assert.throws(() => M.solvePlateCST(frac, {}, { left: 'fixed' }, { rightNodesForce: 100 }), /integer/);
+  const gone = patch(); gone.rightNodes = [4, 99];
+  assert.throws(() => M.solvePlateCST(gone, {}, { left: 'fixed' }, { rightNodesForce: 100 }), /integer/);
+});
+
+test('non-array plate BC and load containers produce validation errors', () => {
+  const mesh = patch();
+  assert.throws(() => M.solvePlateCST(mesh, {}, { fixedNodes: 0 }, {}), /must be an array/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { constraints: 5 }, {}), /must be an array/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { left: 'bogus' }, {}), /unknown plate left/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { right: 3 }, {}), /unknown plate right/);
+  assert.throws(() => M.solvePlateCST(mesh, {}, { left: 'fixed' }, { nodal: 7 }), /must be an array/);
+});
+
+test('a single boundary node carries its declared traction as a point load', () => {
+  const mesh = patch();
+  mesh.rightNodes = [mesh.rightNodes[0]];
+  const s = M.solvePlateCST(mesh, {}, { left: 'fixed' }, { rightNodesForce: 5000 });
+  close(s.equilibrium.sumFx, 5000, 1e-9);
+  const empty = patch(); empty.rightNodes = [];
+  assert.throws(() => M.solvePlateCST(empty, {}, { left: 'fixed' }, { rightNodesForce: 5000 }), /at least one boundary node/);
+  const missing = { nodes: patch().nodes, elements: patch().elements };
+  assert.throws(() => M.solvePlateCST(missing, {}, { left: 'fixed' }, { rightNodesForce: 5000 }), /boundary node list/);
+});
+
+test('constraints with x 0 pin to zero and nonzero prescriptions throw', () => {
+  const mesh = patch();
+  const s = M.solvePlateCST(mesh, {},
+    { constraints: [{ node: 0, x: 0, y: 0 }].concat(mesh.leftNodes.slice(1).map(n => ({ node: n, x: true }))) },
+    { rightNodesForce: 3000 });
+  assert.equal(s.nodes[0].ux, 0);
+  assert.equal(s.nodes[0].uy, 0);
+  assert.throws(() => M.solvePlateCST(patch(), {}, { constraints: [{ node: 0, ux: 5 }] }, {}), /nonzero prescribed/);
+  assert.throws(() => M.solvePlateCST(patch(), {}, { constraints: [{ node: 0, uy: -1 }] }, {}), /nonzero prescribed/);
+});
+
+test('sub micron plates keep their elements under a relative sliver tolerance', () => {
+  const mesh = M.generatePlateMesh(4, 4, 5e-7, 5e-7, 0);
+  assert.equal(mesh.nodes.length, 25);
+  assert.ok(mesh.elements.length >= 32, 'elements survived, got ' + mesh.elements.length);
+});
+
+test('stress measures reject overflow instead of serializing null', () => {
+  assert.throws(() => M.stressMeasures(1e308, 1e308, 1e308), /not finite/);
+  const fine = M.stressMeasures(1e8, -1e8, 5e7);
+  assert.ok(isFinite(fine.vonMises) && fine.tauMax >= 0);
+});
+
+test('scalar load vectors in the top level loads array fail closed', () => {
+  const base = M.getPreset('pratt');
+  assert.throws(() => M.solveTruss({ ...base, loads: [{ node: 2, f: 500 }] }), /load vector must be an array/);
+  const ok = M.solveTruss({ ...base, loads: [{ node: 2, f: [0, -500] }] });
+  close(ok.equilibrium.sumFy, ok.nodes.reduce((s, n) => s + n.load[1], 0), 1e-9);
+});
+

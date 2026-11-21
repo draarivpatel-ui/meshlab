@@ -270,3 +270,112 @@ test('field nodes expose exact position, temperature and flux on pointer inspect
   assert.match(app.$('inspector').textContent, /FIELD NODE/);
 });
 
+test('the CSP meta confines code to self and styles to self plus data attributes', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const meta = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/);
+  assert.ok(meta, 'CSP meta element present');
+  const csp = meta[1];
+  assert.match(csp, /default-src 'none'/);
+  assert.match(csp, /object-src 'none'/);
+  assert.match(csp, /connect-src 'none'/);
+  const directives = Object.fromEntries(csp.split(';').map(d => d.trim().split(/\s+/)).map(parts => [parts[0], parts.slice(1)]));
+  /* scripts stay maximally strict; data-driven member colors and the tooltip
+     position need inline style attributes, which require unsafe-inline */
+  assert.deepEqual(directives['script-src'], ["'self'"]);
+  assert.ok(directives['style-src'].includes("'self'"), 'stylesheets from self');
+  /* CSP3 browsers narrow inline style to attributes only via style-src-attr;
+     the unsafe-inline in style-src is the compatible fallback for older ones */
+  assert.ok(directives['style-src'].includes("'unsafe-inline'"), 'inline style fallback for pre CSP3 browsers');
+  assert.deepEqual(directives['style-src-elem'], ["'self'"], 'no injected style elements');
+  assert.deepEqual(directives['style-src-attr'], ["'unsafe-inline'"], 'dynamic inline style attributes allowed');
+  assert.ok(!csp.includes('unsafe-eval'), 'no unsafe-eval anywhere');
+  assert.ok(!/https?:/i.test(csp), 'no remote origins');
+  /* every script and style asset is a same-directory file, so CSP lets them load */
+  assert.ok(!/src="https?:|href="https?:|src=\'/.test(html));
+});
+
+test('the shell declares no single character shortcuts and they do nothing (WCAG 2.1.4)', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.ok(!/accesskey/i.test(html), 'no accesskey attribute');
+  assert.ok(!/aria-keyshortcuts/i.test(html), 'no aria-keyshortcuts');
+  const app = boot();
+  const marks = app.elements().filter(e => e.getAttribute('data-inspect') !== null);
+  marks[0].focus();
+  const snap = () => ({
+    status: app.$('solve-status').textContent,
+    theme: app.document.documentElement.getAttribute('data-theme'),
+    view: app.$('view-select').value,
+    pinned: app.elements().filter(e => e.getAttribute('aria-pressed') === 'true').length,
+    focus: app.document.activeElement
+  });
+  const before = snap();
+  for (const key of ['a', 's', 'd', 'f', 'e', 'p', 'm', 'r', 't', 'x', '1', '2', '3', '+', '?', 'j', 'k'])
+    marks[0].dispatch('keydown', { key });
+  const after = snap();
+  assert.deepEqual({ status: after.status, theme: after.theme, view: after.view, pinned: after.pinned },
+    { status: before.status, theme: before.theme, view: before.view, pinned: before.pinned });
+  assert.equal(after.focus, before.focus, 'character keys steal no focus');
+});
+
+test('inspection focus guards keep exactly one diagram tab stop on every preset', () => {
+  const app = boot();
+  for (const key of ['pratt', 'crane', 'dome', 'plate', 'heat', 'sink', 'lbeam', 'annulus']) {
+    app.input('preset-select', key, 'change');
+    const marks = app.elements().filter(e => e.getAttribute('data-inspect') !== null);
+    assert.ok(marks.length > 0, key + ' has inspection targets');
+    assert.equal(marks.filter(m => m.getAttribute('tabindex') === '0').length, 1, key + ' one tab stop');
+    assert.ok(marks.every(m => ['0', '-1'].includes(m.getAttribute('tabindex'))), key + ' guarded tabindex');
+  }
+});
+
+test('moment equilibrium residual is rendered for 2D and 3D structures and plates', () => {
+  const app = boot();
+  assert.match(app.$('equilibrium-table').textContent, /Residual Mz/);
+  assert.ok(!/Residual Mx/.test(app.$('equilibrium-table').textContent), '2D hides x/y moments');
+  app.input('preset-select', 'dome', 'change');
+  assert.match(app.$('equilibrium-table').textContent, /Residual Mx/);
+  assert.match(app.$('equilibrium-table').textContent, /Residual My/);
+  assert.match(app.$('equilibrium-table').textContent, /Residual Mz/);
+  app.input('preset-select', 'plate', 'change');
+  assert.match(app.$('equilibrium-table').textContent, /Residual M[+-]/);
+  assert.ok(!/Residual Mz/.test(app.$('equilibrium-table').textContent));
+  assert.equal(app.$('equilibrium-badge').textContent, 'BALANCED');
+});
+
+test('csv export delivers formula-safe member tables for trusses and plates and field cells', async () => {
+  const app = boot();
+  const csvBtn = [...app.document.getElementsByClassName('dl-btn')].find(b => b.getAttribute('data-export') === 'csv');
+  assert.ok(csvBtn, 'csv button exists');
+  csvBtn.click();
+  assert.equal(app.downloads[0].filename, 'pratt.csv');
+  const truss = await app.downloads[0].blob.text();
+  assert.match(truss, /^member_id,label,node_a,node_b/);
+  assert.equal(truss.trimEnd().split('\r\n').length, 35);
+  app.input('preset-select', 'plate', 'change');
+  csvBtn.click();
+  const plate = await app.downloads[app.downloads.length - 1].blob.text();
+  assert.match(plate, /^element_id,node_a,node_b,node_c,area_m2/);
+  assert.ok(plate.includes('vonMises_Pa'));
+  app.input('preset-select', 'heat', 'change');
+  assert.equal(csvBtn.disabled, false);
+  csvBtn.click();
+  const field = await app.downloads[app.downloads.length - 1].blob.text();
+  assert.match(field, /^triangle_id,node_a,node_b,node_c,area_m2/);
+  assert.ok(field.includes('temperature_C') && field.includes('fluxX_W_m2'));
+  assert.ok(!/[,\r\n][=@]/.test(field), 'no unescaped formula cells');
+});
+
+test('json exports for all three engines embed a verifiable SHA-256 integrity hash', async () => {
+  const app = boot(), jsonBtn = [...app.document.getElementsByClassName('dl-btn')].find(b => b.getAttribute('data-export') === 'json');
+  for (const key of ['pratt', 'plate', 'heat']) {
+    app.input('preset-select', key, 'change');
+    jsonBtn.click();
+    const rep = JSON.parse(await app.downloads[app.downloads.length - 1].blob.text());
+    assert.equal(rep.integrity.algorithm, 'SHA-256', key);
+    assert.match(rep.integrity.hash, /^[0-9a-f]{64}$/, key);
+    const hash = rep.integrity.hash;
+    delete rep.integrity;
+    assert.equal(app.sandbox.MeshLab.sha256(JSON.stringify(rep)), hash, key + ' rehash verifies');
+  }
+});
+

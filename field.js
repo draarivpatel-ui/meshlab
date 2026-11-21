@@ -727,7 +727,10 @@
       return String(x);
     };
     var lines = ['# vtk DataFile Version 3.0', title, 'ASCII', 'DATASET UNSTRUCTURED_GRID', 'POINTS ' + n + ' float'];
-    mesh.nodes.forEach(function (node) { lines.push(num(node.x) + ' ' + num(node.y) + ' ' + num(node.z || 0)); });
+    mesh.nodes.forEach(function (node) {
+      var z = (node.z === undefined || node.z === null) ? 0 : node.z;
+      lines.push(num(node.x) + ' ' + num(node.y) + ' ' + num(z));
+    });
     lines.push('CELLS ' + m + ' ' + cellInts);
     mesh.elements.forEach(function (el) { lines.push(el.nodes.length + ' ' + el.nodes.join(' ')); });
     lines.push('CELL_TYPES ' + m);
@@ -745,8 +748,9 @@
           lines.push('VECTORS ' + field.name + ' float');
           field.values.forEach(function (v) {
             if (!v) throw new Error('MeshLab: VTK vector entry missing');
-            var vx = Array.isArray(v) ? v[0] : v.x, vy = Array.isArray(v) ? v[1] : v.y, vz = Array.isArray(v) ? v[2] : (v.z === undefined ? 0 : v.z);
-            lines.push(num(vx) + ' ' + num(vy) + ' ' + num(vz));
+            var vx = Array.isArray(v) ? v[0] : v.x, vy = Array.isArray(v) ? v[1] : v.y;
+            var vz = Array.isArray(v) ? v[2] : v.z;
+            lines.push(num(vx) + ' ' + num(vy) + ' ' + num(vz === undefined || vz === null ? 0 : vz));
           });
         } else {
           lines.push('SCALARS ' + field.name + ' float 1');

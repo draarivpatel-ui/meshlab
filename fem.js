@@ -259,7 +259,8 @@
     });
     return { dim: dim, nodes: nodes, members: members, material: {
       E: E, rho: rho, sigmaYield: yieldStress
-    }, name: input.name || 'Untitled structure', massType: input.massType || 'lumped' };
+    }, name: String(input.name === undefined || input.name === null || input.name === '' ? 'Untitled structure' : input.name),
+      massType: input.massType || 'lumped' };
   }
 
   function nodeCoords(n, dim) { return dim === 3 ? [n.x, n.y, n.z] : [n.x, n.y]; }
@@ -299,7 +300,8 @@
       loads.forEach(function (L) {
         var n = model.nodes[num(L.node !== undefined ? L.node : L.n, -1)];
         if (!n) throw new Error('MeshLab: load references a missing node');
-        var f = L.f || L.load || L.force || [];
+        var f = L.f !== undefined ? L.f : (L.load !== undefined ? L.load : (L.force !== undefined ? L.force : []));
+        if (!Array.isArray(f)) throw new Error('MeshLab: load vector must be an array');
         for (var i = 0; i < model.dim; i++) n.load[i] += checked(f[i], 0, 'load component', false);
       });
     }
@@ -421,13 +423,26 @@
     var dimFactor = model.dim === 3 ? 3 : 2;
     var determinacy = model.members.length + r - dimFactor * model.nodes.length;
     var extFx = 0, extFy = 0, extFz = 0, rx = 0, ry = 0, rz = 0, work = 0;
+    var mx = 0, my = 0, mz = 0, rmx = 0, rmy = 0, rmz = 0, momentScale = 0;
     for (i = 0; i < model.nodes.length; i++) {
       var nd = nodes[i];
-      extFx += nd.load[0]; extFy += nd.load[1];
-      rx += nd.reaction[0]; ry += nd.reaction[1];
+      var fx = nd.load[0], fy = nd.load[1], fz = model.dim === 3 ? nd.load[2] : 0;
+      var Rx = nd.reaction[0], Ry = nd.reaction[1], Rz = model.dim === 3 ? nd.reaction[2] : 0;
+      extFx += fx; extFy += fy; rx += Rx; ry += Ry;
+      /* Moment of every external force (applied load or reaction) about the
+         origin. A correctly assembled system returns these residuals to zero,
+         which is an assembly check independent of the force balance. */
+      mx += nd.y * fz - (nd.z || 0) * fy;
+      my += (nd.z || 0) * fx - nd.x * fz;
+      mz += nd.x * fy - nd.y * fx;
+      rmx += nd.y * Rz - (nd.z || 0) * Ry;
+      rmy += (nd.z || 0) * Rx - nd.x * Rz;
+      rmz += nd.x * Ry - nd.y * Rx;
+      momentScale += Math.hypot(nd.x, nd.y, nd.z || 0) * (Math.hypot(fx, fy, fz) + Math.hypot(Rx, Ry, Rz));
       for (j = 0; j < model.dim; j++) work += nd.load[j] * nd.displacement[j];
-      if (model.dim === 3) { extFz += nd.load[2]; rz += nd.reaction[2]; }
+      if (model.dim === 3) { extFz += fz; rz += Rz; }
     }
+    var residualMoment = Math.hypot(mx + rmx, my + rmy, mz + rmz);
     return {
       name: model.name, dim: model.dim, model: model,
       nodes: nodes, members: members, displacements: Array.from(u),
@@ -447,7 +462,12 @@
       equilibrium: {
         sumFx: extFx, sumFy: extFy, sumFz: extFz,
         sumRx: rx, sumRy: ry, sumRz: rz,
-        residualX: extFx + rx, residualY: extFy + ry, residualZ: extFz + rz
+        residualX: extFx + rx, residualY: extFy + ry, residualZ: extFz + rz,
+        sumMx: mx, sumMy: my, sumMz: mz,
+        sumRMx: rmx, sumRMy: rmy, sumRMz: rmz,
+        residualMx: mx + rmx, residualMy: my + rmy, residualMz: mz + rmz,
+        momentResidual: residualMoment,
+        relativeMomentResidual: residualMoment / Math.max(momentScale, 1e-20)
       }
     };
   }
@@ -597,11 +617,14 @@
       }
     }
     var elements = [];
+    /* Sliver tolerance is relative to a mesh cell so micro scale plates do
+       not silently lose every element. */
+    var minArea2 = (width / nx) * (height / ny) * 1e-9;
     function addTri(a, b, c) {
       if (a < 0 || b < 0 || c < 0) return;
       var na = nodes[a], nb = nodes[b], nc = nodes[c];
       var area2 = (nb.x - na.x) * (nc.y - na.y) - (nc.x - na.x) * (nb.y - na.y);
-      if (Math.abs(area2) < 1e-14) return;
+      if (Math.abs(area2) < minArea2) return;
       if (holeRadius > 0) {
         var points = [na, nb, nc];
         for (var edge = 0; edge < 3; edge++) {
@@ -674,11 +697,15 @@
     sx = checked(sx, 0, 'stress x', false); sy = checked(sy, 0, 'stress y', false); txy = checked(txy, 0, 'shear stress', false);
     var mean = (sx + sy) / 2;
     var rad = Math.sqrt(Math.pow((sx - sy) / 2, 2) + txy * txy);
-    return {
+    var out = {
       sigma1: mean + rad, sigma2: mean - rad,
       tauMax: rad,
       vonMises: Math.sqrt(Math.max(0, sx * sx - sx * sy + sy * sy + 3 * txy * txy))
     };
+    if (!isFinite(out.sigma1) || !isFinite(out.sigma2) || !isFinite(out.tauMax) || !isFinite(out.vonMises)) {
+      throw new Error('MeshLab: stress measures are not finite');
+    }
+    return out;
   }
 
   function solvePlateCST(meshInput, material, bc, loads, options) {
@@ -706,60 +733,87 @@
       elemData.push({ B: c.B, DB: DB, area: c.area, coords: c.coords, idx: idx });
     }
     var cfg = bc || {};
-    function fixSet(list, dofMask) {
-      if (!list) return;
+    /* Every node reference must be an integer id inside the mesh: a fractional
+       id silently redirects DOF indexing, so fail closed. */
+    function nodeRef(nodeId, label) {
+      if (!Number.isInteger(nodeId) || nodeId < 0 || nodeId >= N) {
+        throw new Error('MeshLab: ' + label + ' node reference ' + JSON.stringify(nodeId) + ' is not an integer id inside the mesh');
+      }
+      return nodeId;
+    }
+    function listOf(value, label) {
+      if (value === undefined || value === null) return [];
+      if (!Array.isArray(value)) throw new Error('MeshLab: plate ' + label + ' must be an array');
+      return value;
+    }
+    function fixSet(list, dofMask, label) {
+      /* Node id 0 is a valid node: only skip absent lists, never falsy ids. */
+      if (list === undefined || list === null) return;
       (Array.isArray(list) ? list : [list]).forEach(function (nodeId) {
-        var n = num(nodeId, -1);
-        if (n < 0 || n >= N) return;
+        var n = nodeRef(nodeId, label || 'support');
         if (dofMask[0]) fixed[2 * n] = true;
         if (dofMask[1]) fixed[2 * n + 1] = true;
       });
     }
-    if (cfg.left === 'fixed' || cfg.left === 'pin') fixSet(mesh.leftNodes, [true, true]);
-    else if (cfg.left === 'rollerX') fixSet(mesh.leftNodes, [true, false]);
-    else if (cfg.left === 'rollerY') fixSet(mesh.leftNodes, [false, true]);
-    else if (Array.isArray(cfg.left)) fixSet(cfg.left, [true, true]);
-    if (cfg.right === 'rollerY') fixSet(mesh.rightNodes, [false, true]);
-    else if (cfg.right === 'rollerX') fixSet(mesh.rightNodes, [true, false]);
-    else if (cfg.right === 'fixed') fixSet(mesh.rightNodes, [true, true]);
-    else if (Array.isArray(cfg.right)) fixSet(cfg.right, [true, true]);
-    (cfg.fixedNodes || []).forEach(function (n) { fixSet(n, [true, true]); });
-    (cfg.constraints || []).forEach(function (q) {
-      var node = num(q.node, -1);
-      if (node >= 0 && node < N) {
-        if (q.x || q.ux === 0) fixed[2 * node] = true;
-        if (q.y || q.uy === 0) fixed[2 * node + 1] = true;
-      }
+    function edgeBc(value, nodes, label) {
+      if (value === undefined || value === null) return;
+      if (value === 'fixed' || value === 'pin') return fixSet(nodes, [true, true], label);
+      if (value === 'rollerX') return fixSet(nodes, [true, false], label);
+      if (value === 'rollerY') return fixSet(nodes, [false, true], label);
+      if (Array.isArray(value)) return fixSet(value, [true, true], label);
+      throw new Error('MeshLab: unknown plate ' + label + ' boundary condition ' + JSON.stringify(value));
+    }
+    edgeBc(cfg.left, mesh.leftNodes, 'left');
+    edgeBc(cfg.right, mesh.rightNodes, 'right');
+    listOf(cfg.fixedNodes, 'fixedNodes').forEach(function (n) { fixSet(n, [true, true], 'fixedNodes'); });
+    listOf(cfg.constraints, 'constraints').forEach(function (q) {
+      var node = nodeRef(q.node, 'constraints');
+      if (q.ux !== undefined && q.ux !== 0) throw new Error('MeshLab: nonzero prescribed displacement is not supported');
+      if (q.uy !== undefined && q.uy !== 0) throw new Error('MeshLab: nonzero prescribed displacement is not supported');
+      if (q.x || q.x === 0 || q.ux === 0) fixed[2 * node] = true;
+      if (q.y || q.y === 0 || q.uy === 0) fixed[2 * node + 1] = true;
     });
     /* Default: restrain the left edge in x and the bottom left corner in y. */
     var anyFixed = fixed.some(function (v) { return v; });
     if (!anyFixed) {
-      fixSet(mesh.leftNodes, [true, false]);
+      fixSet(mesh.leftNodes, [true, false], 'left');
       var bottomLeft = mesh.grid ? mesh.grid[0][0] : (mesh.leftNodes || [])[0];
-      if (bottomLeft >= 0) fixed[2 * bottomLeft + 1] = true;
+      if (Number.isInteger(bottomLeft) && bottomLeft >= 0) fixed[2 * bottomLeft + 1] = true;
     }
     var loadCfg = loads || {};
     function applyNodal(list, fx, fy) {
-      if (!list) return;
+      /* Node id 0 is a valid node: only skip absent lists, never falsy ids. */
+      if (list === undefined || list === null) return;
       (Array.isArray(list) ? list : [list]).forEach(function (nodeId) {
-        var n = num(nodeId, -1);
-        if (n < 0 || n >= N) return;
+        var n = nodeRef(nodeId, 'nodal load');
         F[2 * n] += fx; F[2 * n + 1] += fy;
       });
     }
     /* Consistent uniform edge traction: each boundary segment contributes
        q * segmentLength / 2 to both of its end nodes. This reproduces exact
-       uniform stress for a constant strain triangle patch. */
+       uniform stress for a constant strain triangle patch. The traction q is
+       normalised by the covered span (not the full plate height) so the
+       declared total force is applied exactly even when the node list only
+       covers part of the edge. A single node degenerates to a concentrated
+       load so a declared total can never vanish silently. */
     function applyEdgeTraction(list, total, sign) {
-      if (!list || list.length < 2 || !total) return;
-      var q = total / mesh.height;
-      for (var e = 0; e < list.length - 1; e++) {
-        var na = list[e], nb = list[e + 1];
-        if (na < 0 || nb < 0 || na >= N || nb >= N) continue;
-        var seg = Math.abs(mesh.nodes[nb].y - mesh.nodes[na].y);
-        var half = q * seg / 2;
-        F[2 * na] += sign * half;
-        F[2 * nb] += sign * half;
+      if (!total) return;
+      if (!Array.isArray(list)) throw new Error('MeshLab: edge traction needs a boundary node list');
+      var ids = list.map(function (id) { return nodeRef(id, 'edge traction'); });
+      if (ids.length === 0) throw new Error('MeshLab: edge traction needs at least one boundary node');
+      if (ids.length === 1) { F[2 * ids[0]] += sign * total; return; }
+      var segs = [], covered = 0, e;
+      for (e = 0; e < ids.length - 1; e++) {
+        var seg = Math.abs(mesh.nodes[ids[e + 1]].y - mesh.nodes[ids[e]].y);
+        segs.push(seg); covered += seg;
+      }
+      if (!(covered > 0)) { F[2 * ids[0]] += sign * total; return; }
+      var q = total / covered;
+      for (e = 0; e < segs.length; e++) {
+        if (!segs[e]) continue;
+        var half = q * segs[e] / 2;
+        F[2 * ids[e]] += sign * half;
+        F[2 * ids[e + 1]] += sign * half;
       }
     }
     if (loadCfg.rightNodesForce) {
@@ -770,12 +824,14 @@
       applyEdgeTraction(mesh.leftNodes, Math.abs(num(loadCfg.leftNodesForce, 0)),
         Math.sign(num(loadCfg.leftNodesForce, 0)));
     }
-    (loadCfg.nodal || []).forEach(function (q) {
-      var n = num(q.node, -1);
-      if (n >= 0 && n < N) { F[2 * n] += num(q.fx, 0); F[2 * n + 1] += num(q.fy, 0); }
+    listOf(loadCfg.nodal, 'nodal loads').forEach(function (q) {
+      var n = nodeRef(q.node, 'nodal load');
+      F[2 * n] += num(q.fx, 0); F[2 * n + 1] += num(q.fy, 0);
     });
     if (loadCfg.nodalArray && typeof loadCfg.nodalArray === 'object') {
-      applyNodal(loadCfg.nodalArray.nodes || [], num(loadCfg.nodalArray.fx, 0), num(loadCfg.nodalArray.fy, 0));
+      var naNodes = loadCfg.nodalArray.nodes;
+      applyNodal(naNodes === undefined || naNodes === null ? [] : naNodes,
+        num(loadCfg.nodalArray.fx, 0), num(loadCfg.nodalArray.fy, 0));
     }
     var free = [], r = 0;
     for (i = 0; i < ndof; i++) { if (!fixed[i]) free.push(i); else r++; }
@@ -865,9 +921,16 @@
     });
     var vm = elements.map(function (e) { return e.vonMises; });
     var sumFx = 0, sumFy = 0, sumRx = 0, sumRy = 0;
+    var sumM = 0, sumRM = 0, momentScale = 0;
     for (i = 0; i < ndof; i += 2) {
+      var nn = mesh.nodes[i / 2];
       sumFx += F[i]; sumFy += F[i + 1]; sumRx += R[i]; sumRy += R[i + 1];
+      /* Moment about the origin for the external force system at this node. */
+      sumM += nn.x * F[i + 1] - nn.y * F[i];
+      sumRM += nn.x * R[i + 1] - nn.y * R[i];
+      momentScale += Math.hypot(nn.x, nn.y) * (Math.hypot(F[i], F[i + 1]) + Math.hypot(R[i], R[i + 1]));
     }
+    var residualMoment = Math.abs(sumM + sumRM);
     return {
       mesh: mesh, material: { E: E, nu: nu, t: t }, D: D,
       nodes: nodeResults, elements: elements, displacements: Array.from(u),
@@ -881,7 +944,10 @@
       maxDisplacement: peakTranslation(mesh.nodes, 2, u),
       maxSigmaX: Math.max.apply(null, elements.map(function (e) { return e.stress.sigmaX; }).concat([0])),
       equilibrium: { sumFx: sumFx, sumFy: sumFy, sumRx: sumRx, sumRy: sumRy,
-        residualX: sumFx + sumRx, residualY: sumFy + sumRy }
+        residualX: sumFx + sumRx, residualY: sumFy + sumRy,
+        sumM: sumM, sumRM: sumRM, residualM: sumM + sumRM,
+        momentResidual: residualMoment,
+        relativeMomentResidual: residualMoment / Math.max(momentScale, 1e-20) }
     };
   }
 
@@ -1109,8 +1175,116 @@
 
   function fmt(v) {
     if (!isFinite(v)) return '0';
-    if (v !== 0 && (Math.abs(v) >= 1e6 || Math.abs(v) < 1e-4)) return v.toExponential(6);
+    if (v !== 0 && (Math.abs(v) >= 1e6 || Math.abs(v) < 1e-4)) return v.toExponential(9);
     return v.toPrecision(10).replace(/\.?0+$/, '');
+  }
+
+  /* Compact SHA-256 over UTF-8 text. Deterministic and dependency free; the
+     exported reports stamp it as an integrity hash so a received file can be
+     rehashed against the embedded value. Verified against the FIPS vectors. */
+  function sha256Hex(text) {
+    var K = [
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var rotr = function (v, n) { return (v >>> n) | (v << (32 - n)); };
+    var bytes = [], i, c, cp;
+    for (i = 0; i < text.length; i++) {
+      c = text.charCodeAt(i);
+      if (c < 0x80) bytes.push(c);
+      else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
+        text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+        cp = 0x10000 + ((c - 0xd800) << 10) + (text.charCodeAt(++i) - 0xdc00);
+        bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      } else if (c >= 0xd800 && c <= 0xdfff) bytes.push(0xef, 0xbf, 0xbd);
+      else bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    var bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var hiLen = Math.floor(bitLen / 0x100000000);
+    bytes.push((hiLen >>> 24) & 255, (hiLen >>> 16) & 255, (hiLen >>> 8) & 255, hiLen & 255,
+      (bitLen >>> 24) & 255, (bitLen >>> 16) & 255, (bitLen >>> 8) & 255, bitLen & 255);
+    var w = new Array(64), a, b, cc, d, e, f, g, h, i15, i2, s0, s1, t1, t2, maj, ch;
+    for (var off = 0; off < bytes.length; off += 64) {
+      for (i = 0; i < 16; i++) {
+        w[i] = (bytes[off + i * 4] << 24) | (bytes[off + i * 4 + 1] << 16) |
+          (bytes[off + i * 4 + 2] << 8) | bytes[off + i * 4 + 3];
+      }
+      for (i = 16; i < 64; i++) {
+        i15 = w[i - 15]; i2 = w[i - 2];
+        s0 = rotr(i15, 7) ^ rotr(i15, 18) ^ (i15 >>> 3);
+        s1 = rotr(i2, 17) ^ rotr(i2, 19) ^ (i2 >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+      }
+      a = H[0]; b = H[1]; cc = H[2]; d = H[3]; e = H[4]; f = H[5]; g = H[6]; h = H[7];
+      for (i = 0; i < 64; i++) {
+        s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        ch = (e & f) ^ (~e & g);
+        t1 = (h + s1 + ch + K[i] + w[i]) | 0;
+        s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        maj = (a & b) ^ (a & cc) ^ (b & cc);
+        t2 = (s0 + maj) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = cc; cc = b; b = a; a = (t1 + t2) | 0;
+      }
+      H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + cc) | 0; H[3] = (H[3] + d) | 0;
+      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = '';
+    for (i = 0; i < 8; i++) out += ('0000000' + (H[i] >>> 0).toString(16)).slice(-8);
+    return out;
+  }
+
+  /* RFC 4180 style CSV writer with spreadsheet formula-injection hardening.
+     Finite numbers are emitted verbatim (a leading sign is still a numeric
+     literal, not a formula). Text cells whose first character a spreadsheet
+     would read as a formula (=, +, -, @, tab or CR) are apostrophe prefixed,
+     and cells with separators are double quoted. */
+  function csvEscape(value) {
+    var s;
+    if (typeof value === 'number') {
+      if (isFinite(value)) return String(value);
+      s = String(value);
+    } else {
+      s = value === null || value === undefined ? '' : String(value);
+    }
+    if (/^\s*[=+\-@\t\r]/.test(s)) s = "'" + s;
+    if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  function toCsv(header, rows) {
+    var lines = [header.map(csvEscape).join(',')];
+    (rows || []).forEach(function (row) {
+      if (!Array.isArray(row) || row.length !== header.length) throw new Error('MeshLab: CSV row does not match the header');
+      lines.push(row.map(csvEscape).join(','));
+    });
+    return lines.join('\r\n') + '\r\n';
+  }
+
+  function exportMembersCsv(solutionInput, safetyInput) {
+    var sol = solutionInput;
+    if (!sol || !sol.members || !sol.members.length || sol.members[0].axialForce === undefined) sol = solveTruss(solutionInput);
+    var safety = safetyInput || analyzeSafety(sol.model, sol);
+    var header = ['member_id', 'label', 'node_a', 'node_b', 'length_m', 'axial_N',
+      'stress_Pa', 'strain', 'elongation_m', 'strainEnergy_J',
+      'eulerCritical_N', 'slenderness', 'fosYield', 'fosBuckling',
+      'fosGoverning', 'governingMode', 'critical'];
+    var rows = sol.members.map(function (m, i) {
+      var r = safety.members[i] || {};
+      return [m.id + 1, m.label, m.a + 1, m.b + 1, m.length, m.axialForce,
+        m.stress, m.strain, m.delta, m.strainEnergy,
+        r.eulerCriticalLoad, r.slendernessRatio, r.fosYield, r.fosBuckling,
+        r.fosGoverning, r.governingMode, r.critical ? 'CRITICAL' : 'OK'];
+    });
+    return toCsv(header, rows);
   }
 
   function exportCalculiXInp(modelInput) {
@@ -1297,6 +1471,11 @@
           eigenvalue: m.eigenvalue, modeShape: m.modeShape, relativeResidual: m.relativeResidual };
       }) : []
     };
+    /* Integrity stamp: SHA-256 of the compact serialization of everything
+       above. A receiver can delete report.integrity, reserialize and rehash. */
+    report.integrity = { algorithm: 'SHA-256',
+      scope: 'compact JSON of this report without the integrity object',
+      hash: sha256Hex(JSON.stringify(report)) };
     return JSON.stringify(report, null, 2) + '\n';
   }
 
@@ -1325,6 +1504,10 @@
     exportCalculiXInp: exportCalculiXInp,
     exportDeformedSvg: exportDeformedSvg,
     exportReportJson: exportReportJson,
+    exportMembersCsv: exportMembersCsv,
+    toCsv: toCsv,
+    csvEscape: csvEscape,
+    sha256: sha256Hex,
     normalizeModel: normalizeModel,
     solveLinear: solveLinear,
     jacobiEigen: jacobiEigen,
