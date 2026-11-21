@@ -53,7 +53,7 @@ Reproduced with:
 node --test --test-reporter=spec test.js numerics.test.js ui.test.js
 ```
 
-The run passes **182 tests with 0 failures, 0 skipped and 0 cancelled**: 102 structural/export checks, 51 numerical edge case checks and 29 DOM/interface checks. All seven JavaScript source and test files also pass `node --check`.
+The run passes **185 tests with 0 failures, 0 skipped and 0 cancelled**: 102 structural/export checks, 51 numerical edge case checks and 32 DOM/interface checks. All seven JavaScript source and test files also pass `node --check`.
 
 | Measurement | Reproduced value |
 | --- | --- |

@@ -152,6 +152,38 @@ test('static assets are offline, ordered and force line widths remain data drive
   assert.ok(html.indexOf('src="field.js"') < html.indexOf('src="fem.js"')); assert.ok(html.indexOf('src="fem.js"') < html.indexOf('src="app.js"'));
   const rule = css.match(/\.svg-member \{([^}]+)\}/)[1]; assert.ok(!rule.includes('stroke-width'));
 });
+test('the page declares an inline offline favicon so browsers raise no console request', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const icon = html.match(/<link rel="icon" href="([^"]+)">/);
+  assert.ok(icon, 'favicon link exists');
+  assert.match(icon[1], /^data:image\/svg\+xml,/);
+  /* the SVG namespace identifier inside the data URI is never fetched */
+  const fetched = icon[1].replace(/http:\/\/www\.w3\.org\/2000\/svg/g, '');
+  assert.ok(!/https?:/.test(fetched), 'favicon is a data URI, not a network request');
+});
+test('zero force members show the neutral state color, not compression', () => {
+  const app = boot();
+  const rows = [...app.$('member-tbody').children];
+  const zeroRow = rows.find(r => r.children[0].textContent === 'Bottom 7');
+  assert.ok(zeroRow, 'pratt has a zero force member Bottom 7');
+  const mark = zeroRow.getElementsByClassName('state-mark')[0];
+  assert.match(mark.getAttribute('style'), /#8898ac/);
+  assert.match(zeroRow.textContent, /ZERO FORCE/);
+  const tensionRow = rows.find(r => r.children[0].textContent === 'Bottom 4');
+  assert.match(tensionRow.getElementsByClassName('state-mark')[0].getAttribute('style'), /#3987e5/);
+});
+test('field SVG export prints the solved boundary values instead of hardcoded ones', async () => {
+  const app = boot();
+  app.input('preset-select', 'sink', 'change');
+  const buttons = app.document.getElementsByClassName('dl-btn');
+  buttons[1].click();
+  const svg = await app.downloads[app.downloads.length - 1].blob.text();
+  assert.match(svg, /hot edge 80 \/ cold edge 0/);
+  app.input('preset-select', 'heat', 'change');
+  buttons[1].click();
+  const svg2 = await app.downloads[app.downloads.length - 1].blob.text();
+  assert.match(svg2, /hot edge 100 \/ cold edge 0/);
+});
 test('plate ghost boundary toggles draw real undeformed geometry', () => {
   const app = boot(); app.input('preset-select', 'plate', 'change'); app.input('view-select', 'deformed', 'change');
   const ghosts = () => app.$('structure-svg').getElementsByClassName('svg-ghost'); assert.ok(ghosts().length > 0);

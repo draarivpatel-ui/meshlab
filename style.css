@@ -224,7 +224,7 @@ input[type="range"]::-moz-range-thumb {
 }
 .live-dot {
   width: 7px; height: 7px; border-radius: 50%; background: var(--good);
-  box-shadow: 0 0 0 3px rgba(12, 163, 12, 0.16);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent);
 }
 .download-group { display: flex; gap: 6px; }
 .dl-btn {

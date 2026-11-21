@@ -39,7 +39,19 @@
   };
   var patchCheckCache = {};
   var inspectionTargets = [], animationFrame = null, previousTime = null;
-  var reducedMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var reducedMotion = false;
+  if (typeof window.matchMedia === 'function') {
+    var motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    reducedMotion = motionQuery.matches;
+    if (typeof motionQuery.addEventListener === 'function') {
+      motionQuery.addEventListener('change', function (event) {
+        reducedMotion = event.matches;
+        if (reducedMotion) stopAnimation();
+      });
+    } else if (typeof motionQuery.addListener === 'function') {
+      motionQuery.addListener(function (mq) { reducedMotion = mq.matches; });
+    }
+  }
 
   /* ---------- small DOM helpers, all label text goes through textContent ---------- */
 
@@ -496,7 +508,7 @@
 
       var hit = svgEl('line', { x1: fixed(q0[0], 2), y1: fixed(q0[1], 2),
         x2: fixed(q1[0], 2), y2: fixed(q1[1], 2),
-        'class': 'svg-member-hit', tabindex: '0', role: 'img',
+        'class': 'svg-member-hit', tabindex: '0', role: 'button',
         'aria-label': m.label + ' axial force ' + fixed(m.axialForce / 1000, 2) + ' kN' });
       (function (idx, mm, sr) {
         attachTip(hit, mm.label, function () {
@@ -600,7 +612,7 @@
         edgeG.appendChild(outline);
       }
       var hit = svgEl('polygon', { points: pointStr,
-        tabindex: '0', role: 'img',
+        tabindex: '0', role: 'button',
         'aria-label': 'Element ' + (e.id + 1) + ' von Mises ' + fixed(e.vonMises / 1e6, 2) + ' MPa' });
       hit.setAttribute('class', 'svg-plate-hit');
       (function (ee) {
@@ -1139,7 +1151,7 @@
           } else {
             var mark2 = hEl('span', 'state-mark');
             mark2.setAttribute('style', 'background:' +
-              (r.tension ? pal().tension : pal().compression) + ';');
+              (r.tension ? pal().tension : r.compression ? pal().compression : pal().neutral) + ';');
             var wrap2 = hEl('span', 'state-cell');
             wrap2.appendChild(mark2);
             wrap2.appendChild(hEl('span', 'state-text', r.critical ? 'CRITICAL' :
@@ -1358,7 +1370,9 @@
       $('scale-label').textContent = state.view === 'modes' ? 'MODE DISPLAY AMPLITUDE' : 'DEFORMATION SCALE';
       scaleR.disabled = state.view !== 'deformed' && state.view !== 'modes';
     }
-    $('load-label').textContent = state.kind === 'field' ? 'HEATER MULTIPLIER' : 'LOAD MULTIPLIER';
+    $('load-label').textContent = state.kind === 'field'
+      ? (state.model.field && state.model.field.heater !== undefined ? 'HEATER MULTIPLIER' : 'HOT EDGE MULTIPLIER')
+      : 'LOAD MULTIPLIER';
     $('reactions-label').textContent = state.kind === 'field' ? 'Heat flux' : 'Reactions';
     $('view-select').getElementsByTagName('option')[1].textContent = state.kind === 'field' ? 'Temperature field' : 'von Mises stress';
     Array.prototype.forEach.call($('view-select').getElementsByTagName('option'), function (option) { option.disabled = state.kind === 'plate' && (option.value === 'force' || option.value === 'modes'); });
@@ -1463,7 +1477,7 @@
         if (m2 > maxMag * 0.02) drawArrow(svg, projection(e.centroid), [e.fluxX, e.fluxY],
           e.value < midT ? '#e6f5ff' : '#182b3f', null, false, 'svg-field-flux', 10 + 26 * Math.pow(m2 / maxMag, 0.6));
       }
-      var hit = svgEl('polygon', { points: points, 'class': 'svg-plate-hit', 'aria-label': 'Triangle ' + (e.id + 1) + ', temperature ' + fixed(e.value, 2) + ' degrees C' });
+      var hit = svgEl('polygon', { points: points, 'class': 'svg-plate-hit', tabindex: '-1', role: 'button', 'aria-label': 'Triangle ' + (e.id + 1) + ', temperature ' + fixed(e.value, 2) + ' degrees C' });
       attachTip(hit, 'Field triangle ' + (e.id + 1), function () { return [
         { name: 'Temperature', value: fixed(e.value, 2) + ' C' },
         { name: 'Flux x', value: signed(e.fluxX, 2) + ' W/m2' },
@@ -1504,7 +1518,9 @@
       var points = e.nodes.map(function (id) { var p = project(state.field.mesh.nodes[id]); return fixed(p[0], 2) + ',' + fixed(p[1], 2); }).join(' ');
       out.push('<polygon points="' + points + '" fill="' + heatColor(e.value) + '" stroke="#263b55" stroke-width="0.5"/>');
     });
-    out.push('<text x="20" y="28" fill="#eef4fc" font-family="monospace" font-size="14">Poisson FEM / temperature C / hot edge 100 / cold edge 0</text></svg>');
+    var cfg = state.model.field;
+    out.push('<text x="20" y="28" fill="#eef4fc" font-family="monospace" font-size="14">Poisson FEM / temperature C / hot edge ' +
+      fixed(cfg.hotEdge, 0) + ' / cold edge ' + fixed(cfg.coldEdge || 0, 0) + '</text></svg>');
     return out.join('\n') + '\n';
   }
   function fieldTable() {

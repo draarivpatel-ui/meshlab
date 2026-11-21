@@ -52,7 +52,7 @@ All structural engine quantities use SI units: m, N, Pa, kg, Hz and J. Display v
 | `heat` | Irregular mesh, 165 nodes, 280 triangles | Delaunay Poisson FEM |
 | `lbeam` | L-bracket non-convex domain, 285 nodes, 488 triangles | Delaunay Poisson FEM |
 | `annulus` | Annulus with a real hole, 461 nodes, 818 triangles | Delaunay Poisson FEM |
-| `sink` | Finned heat sink domain, 206 nodes, 303 triangles | Delaunay Poisson FEM |
+| `sink` | Finned heat sink domain, 206 nodes, 304 triangles | Delaunay Poisson FEM |
 
 The force count in `m + r - dj` is reported alongside the solved stiffness system. A nonnegative count alone is not a proof of stability. Singular direct systems raise a descriptive error.
 
@@ -62,7 +62,7 @@ The force count in `m + r - dj` is reported alongside the solved stiffness syste
 node --test --test-reporter=spec test.js numerics.test.js ui.test.js
 ```
 
-**182 tests passed, 0 failed, 0 skipped.** The suites contain 102 structural/export checks, 51 numerical and edge case checks, and 29 DOM/interface checks. All test code uses built in Node modules.
+**185 tests passed, 0 failed, 0 skipped.** The suites contain 102 structural/export checks, 51 numerical and edge case checks, and 32 DOM/interface checks. All test code uses built in Node modules.
 
 | Reproduced check | Verified value |
 | --- | --- |
